@@ -3,6 +3,11 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# custom
+.venv/
+results/*
+!results/.gitkeep
+
 # C extensions
 *.so
 
