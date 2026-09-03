@@ -34,6 +34,9 @@ Each parameter point defaults to four independent trajectories evaluated as
 one GPU batch.  Every trajectory is burned in for 100,000 microscopic MC
 steps, followed by 1,000 measurements separated by 100 microscopic MC steps.
 Thus one point contains 4,004 ``f4`` frame values and 4,000 EPR intervals.
+The complete returned trajectories are saved by default under the output
+directory's ``trajectories/`` subdirectory (about 43 GiB for the default
+grid).  Use ``--no-save-trajectories`` when only aggregate results are needed.
 
 Two figures are produced: the paper-style ``f4`` mean/log-variance maps and a
 map of the simulator's exact medium entropy-production rate per particle.  No
@@ -68,7 +71,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.tc_labp import TCLABPConfig, simulate_trajectories
+from models.tc_labp import TCLABPConfig, TCLABPTrajectory, simulate_trajectories
 
 
 OUTPUT_DIR = ROOT / "results" / "tclabp_f4"
@@ -84,6 +87,15 @@ PAPER_F4_DISPLAY_RANGE = (0.0, 0.8)
 # choice; the two rates and their Péclet numbers are not identified.
 DEFAULT_PHIS = tuple(round(0.05 * index, 2) for index in range(1, 11))
 DEFAULT_V0_VALUES = tuple(2.5 * index for index in range(11))
+TRAJECTORY_FIELDS = (
+    "sites",
+    "angles",
+    "occupancy",
+    "exact_ep",
+    "exact_ep_maps",
+    "accepted_hops",
+    "times",
+)
 
 
 @dataclass(frozen=True)
@@ -103,6 +115,7 @@ class SweepConfig:
     dt: float = 1.0e-3
     lattice_spacing: float = 1.0
     base_seed: int = 17_090_395
+    save_trajectories: bool = True
 
 
 CSV_FIELDS = (
@@ -230,12 +243,63 @@ def _condition_seed(config: SweepConfig, condition_index: int, batch_start: int)
     return int(config.base_seed + condition_index * 1_000_003 + batch_start)
 
 
+def _save_trajectory_batch(
+    result: TCLABPTrajectory,
+    *,
+    trajectory_dir: Path,
+    config: SweepConfig,
+    physical: TCLABPConfig,
+    requested_phi: float,
+    v0: float,
+    condition_index: int,
+    batch_start: int,
+) -> Path:
+    """Persist one condition batch without holding the full sweep in memory."""
+
+    trajectory_dir.mkdir(parents=True, exist_ok=True)
+    batch_stop = batch_start + int(result.sites.shape[0])
+    path = trajectory_dir / (
+        f"condition_{condition_index:03d}_batch_{batch_start:03d}-{batch_stop - 1:03d}.pt"
+    )
+    temporary_path = path.with_suffix(".tmp")
+    seed = _condition_seed(config, condition_index, batch_start)
+    torch.save(
+        {
+            "schema_version": 1,
+            "condition": {
+                "condition_index": condition_index,
+                "requested_phi": float(requested_phi),
+                "phi": float(physical.n_particles / physical.lattice_size**2),
+                "v0": float(v0),
+                "Pe": float(physical.Pe),
+                "batch_start": batch_start,
+                "batch_stop": batch_stop,
+                "seed": seed,
+            },
+            "physics": asdict(physical),
+            "sampling": {
+                "steps": config.steps,
+                "burn_steps": config.burn_steps,
+                "sampling_steps": config.sampling_steps,
+                "storage_dtype": "torch.float32",
+            },
+            "trajectory": {
+                field: getattr(result, field) for field in TRAJECTORY_FIELDS
+            },
+        },
+        temporary_path,
+    )
+    temporary_path.replace(path)
+    return path
+
+
 def _simulate_condition(
     config: SweepConfig,
     requested_phi: float,
     v0: float,
     condition_index: int,
     device: torch.device,
+    trajectory_dir: Path | None = None,
 ) -> dict[str, float | int]:
     physical = _physical_config(config, requested_phi, v0)
     interval_duration = float(config.sampling_steps * physical.dt)
@@ -271,6 +335,22 @@ def _simulate_condition(
         f4_trajectory_means.extend(batch_f4.mean(axis=1).tolist())
         epr_trajectory_means.extend(batch_epr_per_particle.tolist())
         ep_interval_means.extend(batch_ep.mean(axis=1).tolist())
+        if trajectory_dir is not None:
+            path = _save_trajectory_batch(
+                result,
+                trajectory_dir=trajectory_dir,
+                config=config,
+                physical=physical,
+                requested_phi=requested_phi,
+                v0=v0,
+                condition_index=condition_index,
+                batch_start=batch_start,
+            )
+            print(
+                f"[trajectory saved] {path.name} "
+                f"({path.stat().st_size / 1024**3:.3f} GiB)",
+                flush=True,
+            )
         del result
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -474,12 +554,20 @@ def _run_condition_on_device(
     v0: float,
     device_name: str,
     cpu_threads: int,
+    trajectory_dir: str | None = None,
 ) -> dict[str, float | int]:
     torch.set_num_threads(cpu_threads)
     device = torch.device(device_name)
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    return _simulate_condition(config, phi, v0, condition_index, device)
+    return _simulate_condition(
+        config,
+        phi,
+        v0,
+        condition_index,
+        device,
+        None if trajectory_dir is None else Path(trajectory_dir),
+    )
 
 
 def _sort_rows(
@@ -497,12 +585,17 @@ def _run_serial(
     torch.set_num_threads(_allocated_cpu_threads(1))
     rows: list[dict[str, float | int]] = []
     total = len(conditions)
+    trajectory_dir = output_dir / "trajectories" if config.save_trajectories else None
     for completed, (condition_index, phi, v0) in enumerate(conditions, start=1):
         print(
             f"[{completed:>3}/{total}] phi={phi:g}, v0={v0:g} -> {device}",
             flush=True,
         )
-        rows.append(_simulate_condition(config, phi, v0, condition_index, device))
+        rows.append(
+            _simulate_condition(
+                config, phi, v0, condition_index, device, trajectory_dir
+            )
+        )
         _write_csv(_sort_rows(rows), output_dir / "tclabp_f4_epr.csv")
     return rows
 
@@ -522,6 +615,7 @@ def _run_parallel(
     active: dict[object, tuple[int, int, float, float]] = {}
     rows: list[dict[str, float | int]] = []
     total = len(conditions)
+    trajectory_dir = output_dir / "trajectories" if config.save_trajectories else None
 
     def submit(worker_index: int) -> None:
         if not pending:
@@ -541,6 +635,7 @@ def _run_parallel(
             v0,
             str(device),
             cpu_threads,
+            None if trajectory_dir is None else str(trajectory_dir),
         )
         active[future] = (worker_index, condition_index, phi, v0)
 
@@ -572,19 +667,48 @@ def _run_parallel(
     return rows
 
 
+def _trajectory_storage_bytes(
+    *, batch: int, frames: int, steps: int, particles: int, lattice_size: int
+) -> int:
+    sites_and_angles = batch * frames * particles * (2 * 8 + 4)
+    occupancy = batch * frames * lattice_size**2
+    ep_maps = batch * steps * lattice_size**2 * 4
+    exact_ep_and_hops = batch * steps * (4 + 8)
+    times = frames * 4
+    return sites_and_angles + occupancy + ep_maps + exact_ep_and_hops + times
+
+
 def _estimated_worker_storage_gib(config: SweepConfig) -> float:
     batch = min(config.trajectories, config.trajectory_batch_size)
     frames = config.steps + 1
-    sites = batch * frames * 2 * 8
-    angles = batch * frames * 4
-    occupancy = batch * frames * config.lattice_size**2
-    ep_maps = batch * config.steps * config.lattice_size**2 * 4
-    hops = batch * config.steps * 8
     max_particles = max(
         _physical_config(config, phi, config.v0_values[0]).n_particles
         for phi in config.phis
     )
-    return float((max_particles * (sites + angles) + occupancy + ep_maps + hops) / 1024**3)
+    size = _trajectory_storage_bytes(
+        batch=batch,
+        frames=frames,
+        steps=config.steps,
+        particles=max_particles,
+        lattice_size=config.lattice_size,
+    )
+    return float(size / 1024**3)
+
+
+def _estimated_total_trajectory_storage_gib(config: SweepConfig) -> float:
+    frames = config.steps + 1
+    size = 0
+    for phi in config.phis:
+        particles = _physical_config(config, phi, config.v0_values[0]).n_particles
+        condition_size = _trajectory_storage_bytes(
+            batch=config.trajectories,
+            frames=frames,
+            steps=config.steps,
+            particles=particles,
+            lattice_size=config.lattice_size,
+        )
+        size += len(config.v0_values) * condition_size
+    return float(size / 1024**3)
 
 
 def _run_metadata(
@@ -592,7 +716,7 @@ def _run_metadata(
     devices: Sequence[torch.device],
 ) -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "paper": _paper_metadata(),
         "sweep": asdict(config),
         "execution": {
@@ -607,6 +731,13 @@ def _run_metadata(
             "burn_steps_per_trajectory": config.burn_steps,
             "sampled_microscopic_steps_per_trajectory": (
                 config.steps * config.sampling_steps
+            ),
+            "trajectories_saved": config.save_trajectories,
+            "trajectory_directory": "trajectories" if config.save_trajectories else None,
+            "estimated_total_trajectory_storage_gib": (
+                _estimated_total_trajectory_storage_gib(config)
+                if config.save_trajectories
+                else 0.0
             ),
             "batch_seed_semantics": (
                 "one deterministic generator seed per condition and trajectory batch"
@@ -678,6 +809,14 @@ def run(
     )
     estimated_storage = _estimated_worker_storage_gib(config)
     print(f"estimated peak stored trajectory per worker: {estimated_storage:.2f} GiB")
+    if config.save_trajectories:
+        estimated_total = _estimated_total_trajectory_storage_gib(config)
+        print(
+            f"saving complete trajectories to {output_dir / 'trajectories'}; "
+            f"estimated total: {estimated_total:.2f} GiB"
+        )
+    else:
+        print("complete trajectory saving is disabled")
 
     conditions = _condition_specs(config)
     rows = (
@@ -771,6 +910,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dt", type=float, default=1.0e-3)
     parser.add_argument("--lattice-spacing", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=17_090_395)
+    parser.add_argument(
+        "--save-trajectories",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="save every returned trajectory tensor (default: enabled)",
+    )
     device_group = parser.add_mutually_exclusive_group()
     device_group.add_argument(
         "--device",
@@ -802,6 +947,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         dt=args.dt,
         lattice_spacing=args.lattice_spacing,
         base_seed=args.seed,
+        save_trajectories=args.save_trajectories,
     )
     devices = (
         _cuda_devices(args.num_gpus)
