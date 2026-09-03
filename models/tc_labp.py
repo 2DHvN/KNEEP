@@ -171,14 +171,15 @@ class TCLABPConfig:
 class TCLABPTrajectory:
     """Saved TC-LABP trajectories and exact hop entropy production.
 
-    Every tensor is on the CPU.  With ``M`` trajectories, ``T`` saved frames,
-    ``N`` particles, and lattice side ``L``, shapes are:
+    Every tensor is on the CPU.  With ``M`` trajectories, ``S`` recorded
+    transitions, ``T=S+1`` saved frames, ``N`` particles, and lattice side
+    ``L``, shapes are:
 
     - ``sites``: ``[M, T, N, 2]`` integer ``(x, y)`` sites.
     - ``angles``: ``[M, T, N]`` orientations in ``[0, 2*pi)``.
     - ``occupancy``: ``[M, T, L, L]`` Boolean hard-core fields.
-    - ``exact_ep`` and ``accepted_hops``: ``[M, T-1]`` interval totals.
-    - ``exact_ep_maps``: ``[M, T-1, L, L]``, in destination-site gauge.
+    - ``exact_ep`` and ``accepted_hops``: ``[M, S]`` transition totals.
+    - ``exact_ep_maps``: ``[M, S, L, L]``, in destination-site gauge.
     - ``times``: ``[T]`` physical times relative to the post-burn frame.
     """
 
@@ -406,18 +407,18 @@ def _advance_step(
 
 def _validate_run_arguments(
     n_trajectories: int,
-    n_samples: int,
+    n_steps: int,
     burn_steps: int,
-    sample_stride: int,
+    sampling_steps: int,
     seed: int,
     storage_dtype: torch.dtype,
 ) -> None:
     """Validate simulator controls independently of the physical config."""
     integer_arguments = {
         "n_trajectories": n_trajectories,
-        "n_samples": n_samples,
+        "n_steps": n_steps,
         "burn_steps": burn_steps,
-        "sample_stride": sample_stride,
+        "sampling_steps": sampling_steps,
         "seed": seed,
     }
     for name, value in integer_arguments.items():
@@ -425,12 +426,12 @@ def _validate_run_arguments(
             raise ValueError(f"{name} must be an integer")
     if n_trajectories <= 0:
         raise ValueError("n_trajectories must be positive")
-    if n_samples <= 0:
-        raise ValueError("n_samples must be positive")
+    if n_steps < 0:
+        raise ValueError("n_steps must be nonnegative")
     if burn_steps < 0:
         raise ValueError("burn_steps must be nonnegative")
-    if sample_stride <= 0:
-        raise ValueError("sample_stride must be positive")
+    if sampling_steps <= 0:
+        raise ValueError("sampling_steps must be positive")
     if storage_dtype not in (torch.float32, torch.float64):
         raise ValueError("storage_dtype must be torch.float32 or torch.float64")
 
@@ -439,9 +440,9 @@ def _validate_run_arguments(
 def simulate_trajectories(
     config: TCLABPConfig,
     n_trajectories: int,
-    n_samples: int,
+    n_steps: int,
     burn_steps: int,
-    sample_stride: int,
+    sampling_steps: int,
     seed: int,
     simulation_device: torch.device | str = "cpu",
     storage_dtype: torch.dtype = torch.float32,
@@ -449,19 +450,21 @@ def simulate_trajectories(
 ) -> TCLABPTrajectory:
     """Simulate and return a post-burn trajectory entirely on the CPU.
 
-    Frame zero is the state immediately after ``burn_steps``.  Each later
-    frame is separated by ``sample_stride`` full MC steps.  Thus output shapes
-    are ``sites [M,T,N,2]``, ``angles [M,T,N]``, ``occupancy [M,T,L,L]``,
-    interval arrays ``[M,T-1]``, EP maps ``[M,T-1,L,L]``, and times ``[T]``.
-    All accepted hops in an interval contribute; sampling never drops EP.
+    Frame zero is the state immediately after ``burn_steps``.  The run records
+    exactly ``n_steps`` transitions and therefore returns ``n_steps + 1``
+    frames.  Each recorded transition contains ``sampling_steps`` full MC
+    steps.  With ``S=n_steps`` and ``T=S+1``, output shapes are
+    ``sites [M,T,N,2]``, ``angles [M,T,N]``, ``occupancy [M,T,L,L]``, interval
+    arrays ``[M,S]``, EP maps ``[M,S,L,L]``, and times ``[T]``.  All accepted
+    hops in a recorded transition contribute; sampling never drops EP.
     """
     if not isinstance(config, TCLABPConfig):
         raise TypeError("config must be a TCLABPConfig")
     _validate_run_arguments(
         n_trajectories,
-        n_samples,
+        n_steps,
         burn_steps,
-        sample_stride,
+        sampling_steps,
         seed,
         storage_dtype,
     )
@@ -475,6 +478,7 @@ def simulate_trajectories(
     generator.manual_seed(int(seed))
     lattice_size = config.lattice_size
     n_particles = config.n_particles
+    n_frames = n_steps + 1
 
     sites = torch.empty(
         (n_trajectories, n_particles, 2), dtype=torch.long, device=device
@@ -513,25 +517,25 @@ def simulate_trajectories(
         )
 
     saved_sites = torch.empty(
-        (n_trajectories, n_samples, n_particles, 2), dtype=torch.long
+        (n_trajectories, n_frames, n_particles, 2), dtype=torch.long
     )
     saved_angles = torch.empty(
-        (n_trajectories, n_samples, n_particles), dtype=storage_dtype
+        (n_trajectories, n_frames, n_particles), dtype=storage_dtype
     )
     saved_occupancy = torch.empty(
-        (n_trajectories, n_samples, lattice_size, lattice_size), dtype=torch.bool
+        (n_trajectories, n_frames, lattice_size, lattice_size), dtype=torch.bool
     )
     saved_ep_maps = torch.empty(
         (
             n_trajectories,
-            n_samples - 1,
+            n_steps,
             lattice_size,
             lattice_size,
         ),
         dtype=storage_dtype,
     )
     saved_hops = torch.empty(
-        (n_trajectories, n_samples - 1), dtype=torch.long
+        (n_trajectories, n_steps), dtype=torch.long
     )
 
     def save_frame(index: int) -> None:
@@ -541,7 +545,7 @@ def simulate_trajectories(
 
     save_frame(0)
     for interval in trange(
-        n_samples - 1,
+        n_steps,
         desc="TC-LABP sampling",
         leave=False,
         disable=not progress,
@@ -554,7 +558,7 @@ def simulate_trajectories(
         interval_hops = torch.zeros(
             n_trajectories, dtype=torch.long, device=device
         )
-        for _ in range(sample_stride):
+        for _ in range(sampling_steps):
             angles, step_map, step_hops = _advance_step(
                 config,
                 sites,
@@ -575,8 +579,8 @@ def simulate_trajectories(
     # gauge and makes the documented map-sum invariant exact.
     exact_ep = saved_ep_maps.sum(dim=(-2, -1))
     times = (
-        torch.arange(n_samples, dtype=storage_dtype)
-        * float(sample_stride)
+        torch.arange(n_frames, dtype=storage_dtype)
+        * float(sampling_steps)
         * config.effective_dt
     )
     return TCLABPTrajectory(
@@ -633,7 +637,7 @@ def encode_observations(
     if not include_angle:
         return density
 
-    n_trajectories, n_samples, n_particles = result.angles.shape
+    n_trajectories, n_frames, n_particles = result.angles.shape
     lattice_size = result.occupancy.shape[-1]
     if result.sites.numel() and (
         int(result.sites.min()) < 0 or int(result.sites.max()) >= lattice_size
@@ -641,17 +645,17 @@ def encode_observations(
         raise ValueError("site index lies outside the occupancy lattice")
     linear_sites = (
         result.sites[..., 0] * lattice_size + result.sites[..., 1]
-    ).view(n_trajectories * n_samples, n_particles)
+    ).view(n_trajectories * n_frames, n_particles)
     cosine_field = torch.zeros(
-        (n_trajectories * n_samples, lattice_size * lattice_size),
+        (n_trajectories * n_frames, lattice_size * lattice_size),
         dtype=result.angles.dtype,
     )
     sine_field = torch.zeros_like(cosine_field)
-    flat_angles = result.angles.reshape(n_trajectories * n_samples, n_particles)
+    flat_angles = result.angles.reshape(n_trajectories * n_frames, n_particles)
     cosine_field.scatter_add_(1, linear_sites, torch.cos(flat_angles))
     sine_field.scatter_add_(1, linear_sites, torch.sin(flat_angles))
     cosine_field = cosine_field.view(
-        n_trajectories, n_samples, lattice_size, lattice_size
+        n_trajectories, n_frames, lattice_size, lattice_size
     )
     sine_field = sine_field.view_as(cosine_field)
     return torch.cat(
