@@ -17,11 +17,11 @@ Offset = tuple[int, int]
 class SAOUConfig:
     lattice_size: int = 32
     radii: tuple[int, ...] = (1, 2, 3, 4)
-    amplitudes: tuple[float, ...] = (1.0, 1.0, 0.0, 1.0)
+    amplitudes: tuple[float, ...] = (0.0, 1.0, 1.0, 0.0)
     gamma: float = 1.0
-    omega0: float = 2.0
-    temperature: float = 1e-3
-    dt: float = 1e-4
+    omega0: float = 3.0
+    temperature: float = 0.1
+    dt: float = 1e-2
     weight_normalization: str = "mean"
 
     def __post_init__(self) -> None:
@@ -264,6 +264,14 @@ def _relative_kernel(shell: Shell) -> dict[Offset, float]:
     return {offset: value for offset, value in kernel.items() if abs(value) > 1e-15}
 
 
+def _absolute_kernel(shell: Shell) -> dict[Offset, float]:
+    return {
+        offset: float(weight)
+        for offset, weight in zip(shell.offsets, shell.weights)
+        if abs(float(weight)) > 1e-15
+    }
+
+
 def _kernel_inner(
     first: dict[Offset, float], second: dict[Offset, float]
 ) -> float:
@@ -288,6 +296,39 @@ def theoretical_epr_gram(config: SAOUConfig) -> np.ndarray:
                 * _kernel_inner(kernels[row], kernels[column])
             )
     return gram
+
+
+def theoretical_epr_gram_absolute(config: SAOUConfig) -> np.ndarray:
+    """Return the exact Gram matrix in the estimator's absolute-shell basis.
+
+    The physical velocity is rewritten as a local term plus disjoint absolute
+    shell convolutions.  This is the basis produced by
+    :class:`shell_force.ShellForceKNEEP2D`, so its row sums are the analytic
+    targets for the learned branch spectrum.  The stationary ensemble average
+    is independent of both trajectories and temperature.
+    """
+    shells = _make_shells(config)
+    center_coefficient = config.omega0 - sum(
+        shell.amplitude * float(shell.weights.sum()) for shell in shells
+    )
+    coefficients = [center_coefficient, *(shell.amplitude for shell in shells)]
+    kernels = [{(0, 0): 1.0}, *(_absolute_kernel(shell) for shell in shells)]
+    gram = np.empty((len(coefficients), len(coefficients)), dtype=np.float64)
+    prefactor = 2.0 * config.lattice_size**2 / config.gamma
+    for row in range(len(coefficients)):
+        for column in range(len(coefficients)):
+            gram[row, column] = (
+                prefactor
+                * coefficients[row]
+                * coefficients[column]
+                * _kernel_inner(kernels[row], kernels[column])
+            )
+    return gram
+
+
+def theoretical_epr_components_absolute(config: SAOUConfig) -> np.ndarray:
+    """Return analytic rates for ``[local, shell 1, ..., shell R]``."""
+    return theoretical_epr_gram_absolute(config).sum(axis=1)
 
 
 def theoretical_epr_rate(config: SAOUConfig) -> float:

@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+from numbers import Integral
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _activation(name: str) -> nn.Module:
+    if name == "relu":
+        return nn.ReLU(inplace=True)
+    if name == "elu":
+        return nn.ELU(inplace=True)
+    raise ValueError("activation must be 'relu' or 'elu'")
 
 
 class ShellAbsoluteConv2d(nn.Module):
@@ -45,22 +55,24 @@ class _ShellForceBranch2D(nn.Module):
     def __init__(
         self,
         radius: int,
-        n_components: int,
+        input_components: int,
+        output_components: int,
         hidden_channels: int,
         hidden_layers: int,
+        activation: str,
     ) -> None:
         super().__init__()
         self.radius = radius
 
         if radius == 0:
             self.center_proj = nn.Conv2d(
-                n_components, hidden_channels, kernel_size=1, bias=True
+                input_components, hidden_channels, kernel_size=1, bias=True
             )
             self.rel_proj = None
         else:
             self.center_proj = None
             self.rel_proj = ShellAbsoluteConv2d(
-                n_components, hidden_channels, radius=radius
+                input_components, hidden_channels, radius=radius
             )
 
         layers: list[nn.Module] = []
@@ -70,13 +82,13 @@ class _ShellForceBranch2D(nn.Module):
                     nn.Conv2d(
                         hidden_channels, hidden_channels, kernel_size=1, bias=True
                     ),
-                    nn.ELU(inplace=True),
+                    _activation(activation),
                 )
             )
         layers.append(
-            nn.Conv2d(hidden_channels, n_components, kernel_size=1, bias=True)
+            nn.Conv2d(hidden_channels, output_components, kernel_size=1, bias=True)
         )
-        self.activation = nn.ELU(inplace=True)
+        self.activation = _activation(activation)
         self.force_head = nn.Sequential(*layers)
 
     def forward(self, midpoint: torch.Tensor) -> torch.Tensor:
@@ -88,11 +100,15 @@ class _ShellForceBranch2D(nn.Module):
 
 
 class ShellForceKNEEP2D(nn.Module):
-    """Current SAOU KNEEP: local branch plus learned absolute shells.
+    """Periodic KNEEP with a local branch and learned absolute shells.
 
     Input shape is ``[batch, 2, components, height, width]``. The ordinary
     output contains one spatially averaged EP increment per branch and has
-    shape ``[batch, max_distance + 1]``.
+    shape ``[batch, max_distance + 1]``. All components condition the learned
+    force. ``ep_component_indices`` can restrict the increment components in
+    the final force--increment contraction. This lets reversible variables,
+    such as LABP orientation, provide context without assigning them a direct
+    entropy-production contribution.
     """
 
     def __init__(
@@ -101,22 +117,47 @@ class ShellForceKNEEP2D(nn.Module):
         hidden_channels: int = 8,
         hidden_layers: int = 2,
         max_distance: int = 4,
+        ep_component_indices: tuple[int, ...] | None = None,
+        activation: str = "elu",
     ) -> None:
         super().__init__()
         if n_components <= 0 or hidden_channels <= 0 or hidden_layers <= 0:
             raise ValueError("channel and layer counts must be positive")
         if max_distance < 0:
             raise ValueError("max_distance must be nonnegative")
+        _activation(activation)
+
+        if ep_component_indices is None:
+            ep_component_indices = tuple(range(n_components))
+        else:
+            if any(
+                isinstance(index, bool) or not isinstance(index, Integral)
+                for index in ep_component_indices
+            ):
+                raise ValueError("ep_component_indices must contain integers")
+            ep_component_indices = tuple(int(index) for index in ep_component_indices)
+        if not ep_component_indices:
+            raise ValueError("ep_component_indices must not be empty")
+        if len(set(ep_component_indices)) != len(ep_component_indices):
+            raise ValueError("ep_component_indices must be unique")
+        if any(index < 0 or index >= n_components for index in ep_component_indices):
+            raise ValueError("ep_component_indices contain an out-of-range channel")
 
         self.n_components = n_components
+        self.hidden_channels = hidden_channels
+        self.hidden_layers = hidden_layers
+        self.ep_component_indices = ep_component_indices
         self.max_distance = max_distance
+        self.activation_name = activation
         self.branches = nn.ModuleList(
             [
                 _ShellForceBranch2D(
                     radius=radius,
-                    n_components=n_components,
+                    input_components=n_components,
+                    output_components=len(ep_component_indices),
                     hidden_channels=hidden_channels,
                     hidden_layers=hidden_layers,
+                    activation=activation,
                 )
                 for radius in range(max_distance + 1)
             ]
@@ -140,6 +181,26 @@ class ShellForceKNEEP2D(nn.Module):
         first, second = pair[:, 0], pair[:, 1]
         return 0.5 * (first + second), second - first
 
+    def component_ep_maps(self, pair: torch.Tensor) -> torch.Tensor:
+        """Return raw EP maps resolved by shell and contracted component.
+
+        The result has shape ``[batch, branch, component, height, width]``.
+        Its component axis follows :attr:`ep_component_indices`, and summing
+        that axis exactly recovers ``forward(pair, return_maps=True)``.  The
+        decomposition is coordinate dependent, but makes each selected state
+        increment's learned contribution directly inspectable.
+        """
+        midpoint, increment = self._split_pair(pair)
+        contracted_increment = increment[:, self.ep_component_indices]
+        return torch.stack(
+            [branch(midpoint) * contracted_increment for branch in self.branches],
+            dim=1,
+        )
+
+    def component_ep_scores(self, pair: torch.Tensor) -> torch.Tensor:
+        """Return spatially averaged component EP scores ``[batch, branch, component]``."""
+        return self.component_ep_maps(pair).mean(dim=(-2, -1))
+
     def forward(
         self,
         pair: torch.Tensor,
@@ -150,16 +211,18 @@ class ShellForceKNEEP2D(nn.Module):
 
         ``return_maps=True`` returns per-site raw scores whose spatial mean is
         the ordinary branch output. ``return_forces=True`` alone returns only
-        forces; requesting both returns ``(maps, forces)``.
+        forces for the contracted components; requesting both returns
+        ``(maps, forces)``.
         """
         midpoint, increment = self._split_pair(pair)
+        contracted_increment = increment[:, self.ep_component_indices]
         branch_values: list[torch.Tensor] = []
         maps: list[torch.Tensor] = []
         forces: list[torch.Tensor] = []
 
         for branch in self.branches:
             force = branch(midpoint)
-            local_ep = (force * increment).sum(dim=1, keepdim=True)
+            local_ep = (force * contracted_increment).sum(dim=1, keepdim=True)
             if return_forces:
                 forces.append(force.unsqueeze(1))
             if return_maps:
