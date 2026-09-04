@@ -1,48 +1,3 @@
-"""Map TC-LABP clustering and entropy production in the ``(phi, v0)`` plane.
-
-The clustering observable follows Whitelam, Klymko, and Mandal,
-"Phase separation and large deviations of lattice active matter",
-J. Chem. Phys. 148, 154902 (2018), Fig. 2
-(https://doi.org/10.1063/1.5023403):
-
-* ``phi = N / L**2`` is the occupied-site fraction on an ``L x L`` lattice.
-* ``f4 = N4 / N`` is the fraction of particles whose four cardinal
-  nearest-neighbour sites are all occupied.
-* Their Fig. 2 plots ``<f4>`` and ``log(<f4**2> - <f4>**2)`` against ``phi``
-  and the *forward hopping rate* ``v+``.  The labelled ticks are
-  ``phi = 0.1, ..., 0.5`` and ``v+ = 5, 10, ..., 25``; ``L=100``,
-  ``v- = v0 = 1``, and ``D+ = D- = D_rot = 0.1``.  The paper does not list
-  the underlying numerical grid points, so tick locations must not be called
-  the exact raw sampling grid.
-* Because that paper uses event-driven continuous-time Monte Carlo, its state
-  averages are residence-time weighted by ``1/R(C)``.  The TC-LABP frames in
-  this script are uniformly separated in physical time, so their ordinary
-  arithmetic mean is the corresponding time average.
-
-This script applies those ``phi`` and ``f4`` definitions to the repository's
-TC-LABP model; it is not a reproduction of the paper's dynamics.  In
-particular, ``v0`` below means ``TCLABPConfig.speed``, the continuous-angle
-self-propulsion speed.  It is not the paper's lateral hopping rate also named
-``v0``.  With the default ``lattice_spacing = translational_diffusion = 1``,
-TC-LABP has its own grid Péclet number ``Pe = v0``.  The default ``v0`` values
-use spacing 2.5, half the paper's labelled ``v+`` tick interval; the default
-``phi`` spacing is similarly 0.05, half its labelled interval.  These are
-explicit resolution choices because the raw paper grid was not reported, and
-do not identify the two rates or their differently defined Péclet numbers.
-
-Each parameter point defaults to four independent trajectories evaluated as
-one GPU batch.  Every trajectory is burned in for 100,000 microscopic MC
-steps, followed by 1,000 measurements separated by 100 microscopic MC steps.
-Thus one point contains 4,004 ``f4`` frame values and 4,000 EPR intervals.
-The complete returned trajectories are saved by default under the output
-directory's ``trajectories/`` subdirectory (about 43 GiB for the default
-grid).  Use ``--no-save-trajectories`` when only aggregate results are needed.
-
-Two figures are produced: the paper-style ``f4`` mean/log-variance maps and a
-map of the simulator's exact medium entropy-production rate per particle.  No
-KNEEP model is trained by this script.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -75,16 +30,6 @@ from models.tc_labp import TCLABPConfig, TCLABPTrajectory, simulate_trajectories
 
 
 OUTPUT_DIR = ROOT / "results" / "tclabp_f4"
-PAPER_URL = "https://doi.org/10.1063/1.5023403"
-PAPER_ARXIV_URL = "https://arxiv.org/abs/1709.03951"
-PAPER_PHI_TICKS = (0.1, 0.2, 0.3, 0.4, 0.5)
-PAPER_V_PLUS_TICKS = (5.0, 10.0, 15.0, 20.0, 25.0)
-PAPER_F4_DISPLAY_RANGE = (0.0, 0.8)
-
-# The paper does not publish its raw grid.  These TC-LABP defaults use half
-# the distance between the labelled Fig. 2 ticks: Delta phi=0.05 and
-# Delta v0=2.5.  Reusing the v+ numerical scale for TC-LABP v0 is only a grid
-# choice; the two rates and their Péclet numbers are not identified.
 DEFAULT_PHIS = tuple(round(0.05 * index, 2) for index in range(1, 11))
 DEFAULT_V0_VALUES = tuple(2.5 * index for index in range(11))
 TRAJECTORY_FIELDS = (
@@ -104,16 +49,16 @@ class SweepConfig:
 
     phis: tuple[float, ...] = DEFAULT_PHIS
     v0_values: tuple[float, ...] = DEFAULT_V0_VALUES
-    lattice_size: int = 100
-    trajectories: int = 4
-    trajectory_batch_size: int = 4
+    lattice_size: int = 30
+    trajectories: int = 16
+    trajectory_batch_size: int = 16
     steps: int = 1_000
     burn_steps: int = 100_000
     sampling_steps: int = 100
-    rotational_diffusion: float = 1.0
+    rotational_diffusion: float = 1.5
     translational_diffusion: float = 1.0
-    dt: float = 1.0e-3
-    lattice_spacing: float = 1.0
+    dt: float = 1.0e-4
+    lattice_spacing: float = 0.5
     base_seed: int = 17_090_395
     save_trajectories: bool = True
 
@@ -422,8 +367,7 @@ def _plot_f4(rows: Sequence[dict[str, float | int]], output_dir: Path) -> Path:
     fig, axes = plt.subplots(1, 2, figsize=(11.8, 4.7), constrained_layout=True)
     mesh0 = axes[0].pcolormesh(
         _cell_edges(phis), _cell_edges(v0_values), mean_f4,
-        shading="flat", cmap="viridis", vmin=PAPER_F4_DISPLAY_RANGE[0],
-        vmax=PAPER_F4_DISPLAY_RANGE[1],
+        shading="flat", cmap="viridis", vmin=0, vmax=0.8
     )
     mesh1 = axes[1].pcolormesh(
         _cell_edges(phis), _cell_edges(v0_values), display_log_variance,
@@ -471,67 +415,6 @@ def _write_csv(rows: Iterable[dict[str, float | int]], path: Path) -> None:
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
-
-
-def _paper_metadata() -> dict[str, object]:
-    return {
-        "citation": (
-            "S. Whitelam, K. Klymko, and D. Mandal, Phase separation and large "
-            "deviations of lattice active matter, J. Chem. Phys. 148, 154902 (2018)"
-        ),
-        "url": PAPER_URL,
-        "arxiv_url": PAPER_ARXIV_URL,
-        "phi_definition": "N / L^2 (occupied-site fraction)",
-        "f4_definition": (
-            "N4 / N, where N4 counts particles with all four cardinal "
-            "neighbours occupied"
-        ),
-        "figure_2_quantities": ["mean(f4)", "log(mean(f4^2)-mean(f4)^2)"],
-        "figure_2_lattice_size": 100,
-        "figure_2_initial_condition": "disordered",
-        "figure_2_simulations_per_parameter_point": 1,
-        "figure_2_average": (
-            "continuous-time residence weighting: sum_k Q(C_k)/R(C_k) "
-            "divided by sum_k 1/R(C_k)"
-        ),
-        "figure_2_approximate_visible_phi_range": [0.05, 0.5],
-        "figure_2_approximate_visible_v_plus_range": [0.5, 25.0],
-        "figure_2_labelled_phi_ticks": list(PAPER_PHI_TICKS),
-        "figure_2_labelled_v_plus_ticks": list(PAPER_V_PLUS_TICKS),
-        "figure_2_mean_f4_display_range": list(PAPER_F4_DISPLAY_RANGE),
-        "figure_2_exact_sampling_grid_reported": False,
-        "fixed_rates": {"v_minus": 1.0, "v0_lateral": 1.0, "D_plus": 0.1, "D_minus": 0.1},
-        "paper_activity_relation": "Pe = 5 * (v_plus - 1)",
-        "epr_calculated_in_paper": False,
-        "default_grid_caveat": (
-            "Default spacings Delta phi=0.05 and Delta v0=2.5 are half the "
-            "paper's labelled tick intervals. This is a resolution choice, not "
-            "a mapping between rates or Pe definitions."
-        ),
-        "model_difference": (
-            "The paper scans its discrete-orientation CTMC forward rate v_plus. "
-            "This script scans TCLABPConfig.speed, denoted v0, in the "
-            "continuous-angle TC-LABP model."
-        ),
-    }
-
-
-def describe_paper_conventions() -> str:
-    """Return the paper definitions printed at the start of every run."""
-
-    return (
-        "Paper convention (Whitelam, Klymko & Mandal, Fig. 2):\n"
-        "  phi = N/L^2; visible range is about 0.05--0.50; labelled ticks "
-        "= 0.1, 0.2, 0.3, 0.4, 0.5\n"
-        "  f4 = fraction of particles with all four cardinal neighbours occupied\n"
-        "  plotted mean-f4 colour range = 0--0.8 (mathematical range is 0--1)\n"
-        "  plotted activity = v_plus, not v0; labelled v_plus ticks = 5, 10, 15, 20, 25\n"
-        "  L=100, v_minus=v0(lateral)=1, D_plus=D_minus=0.1\n"
-        "  exact simulation grid/run length and EPR were not reported in that paper\n"
-        "TC-LABP convention in this script:\n"
-        "  v0 = TCLABPConfig.speed (self-propulsion); it is not the paper's lateral v0\n"
-        "  grid spacing is half the labelled paper tick spacing; dynamics still differ"
-    )
 
 
 def _condition_specs(config: SweepConfig) -> list[tuple[int, float, float]]:
@@ -716,8 +599,6 @@ def _run_metadata(
     devices: Sequence[torch.device],
 ) -> dict[str, object]:
     return {
-        "schema_version": 3,
-        "paper": _paper_metadata(),
         "sweep": asdict(config),
         "execution": {
             "devices": [str(device) for device in devices],
@@ -742,32 +623,7 @@ def _run_metadata(
             "batch_seed_semantics": (
                 "one deterministic generator seed per condition and trajectory batch"
             ),
-        },
-        "semantics": {
-            "f4_average": "equal-time average over post-burn fixed-step TC-LABP frames",
-            "f4_variance": "population variance over all saved frames and replicas",
-            "epr": (
-                "exact accepted-hop medium entropy production; system boundary "
-                "entropy omitted"
-            ),
-            "epr_plot_normalization": "per particle per physical time",
-            "recorded_interval_duration": config.sampling_steps * config.dt,
-            "grid_rationale": (
-                "The paper does not report raw grid points. Delta phi=0.05 and "
-                "Delta v0=2.5 are half its labelled Fig. 2 tick intervals; the "
-                "v0 numerical scale is not a mapping to the paper's v_plus."
-            ),
-            "phase_classification_threshold_used": False,
-            "paper_simulations_per_point": 1,
-            "replicas_per_point_rationale": (
-                "four independent TC-LABP trajectories provide a minimal between-run SEM; "
-                "the paper used one simulation per parameter point"
-            ),
-            "burn_in_rationale": (
-                "100000 microscopic steps is the requested production default; the paper "
-                "does not report a Fig. 2 burn-in length or guarantee convergence at this value"
-            ),
-        },
+        }
     }
 
 
@@ -794,7 +650,6 @@ def run(
         json.dumps(_run_metadata(config, selected_devices), indent=2),
         encoding="utf-8",
     )
-    print(describe_paper_conventions())
     print(f"devices={', '.join(map(str, selected_devices))}; output={output_dir}")
     print(
         f"grid={len(config.phis)} phi x {len(config.v0_values)} v0 "
@@ -899,16 +754,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--v0-values", type=float, nargs="+", default=list(DEFAULT_V0_VALUES)
     )
-    parser.add_argument("--lattice-size", type=int, default=100)
-    parser.add_argument("--trajectories", type=int, default=4)
-    parser.add_argument("--trajectory-batch-size", type=int, default=4)
+    parser.add_argument("--lattice-size", type=int, default=30)
+    parser.add_argument("--trajectories", type=int, default=16)
+    parser.add_argument("--trajectory-batch-size", type=int, default=16)
     parser.add_argument("--steps", type=int, default=1_000)
     parser.add_argument("--burn-steps", type=int, default=100_000)
     parser.add_argument("--sampling-steps", type=int, default=100)
-    parser.add_argument("--rotational-diffusion", type=float, default=1.0)
+    parser.add_argument("--rotational-diffusion", type=float, default=1.5)
     parser.add_argument("--translational-diffusion", type=float, default=1.0)
-    parser.add_argument("--dt", type=float, default=1.0e-3)
-    parser.add_argument("--lattice-spacing", type=float, default=1.0)
+    parser.add_argument("--dt", type=float, default=1.0e-4)
+    parser.add_argument("--lattice-spacing", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=17_090_395)
     parser.add_argument(
         "--save-trajectories",
