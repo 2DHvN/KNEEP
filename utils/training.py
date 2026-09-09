@@ -142,9 +142,7 @@ def train_model(
         mean_cpu, std_cpu = normalization
         if mean_cpu.shape != std_cpu.shape or torch.any(std_cpu <= 0):
             raise ValueError("invalid precomputed normalization")
-    # Network parameters and sampled pairs are float32.  Keeping statistics in
-    # a float64 video's dtype would promote normalized pairs back to float64
-    # and make Conv2d reject them.
+        
     mean = mean_cpu.to(device=target, dtype=torch.float32)
     std = std_cpu.to(device=target, dtype=torch.float32)
 
