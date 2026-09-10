@@ -29,21 +29,32 @@ python KNEEP/scripts/saou_perform.py
 python KNEEP/scripts/saou_perform.py --num-gpus 2
 ```
 
+To redraw completed results without loading trajectories or models:
+
+```bash
+python KNEEP/scripts/plot_saou_perform.py
+```
+
+This reads only `runs.csv` and `kernel_runs.csv`. The performance plot uses
+the actual A-squared coordinates, mean and sample-standard-deviation error bars
+over training seeds, and the one-step continuous theory as solid straight
+lines. Kernel spectra follow the grouped-histogram style used in
+`Corr_SAOU.ipynb`.
+
 Outputs are written under `results/saou_perform/`: the 30 fixed trajectory
 files, 75 trained-model checkpoints, run/summary/kernel CSV files, unsmoothed
-loss histories and plots, `figures/a2_delta_s.png`, and 15 condition-wise
-kernel-decomposition figures. The performance figure uses boxes and individual
-points for the five training seeds; exact one-step theory is shown by solid
-lines. Completed data and checkpoints are reused when the command is restarted.
-Use one controller process per results directory; multi-GPU work is handled by
-`--num-gpus`.
+loss histories and plots, and the derived figures. Running
+`plot_saou_perform.py` replaces `figures/a2_delta_s.png` with the
+publication-style error-bar version and writes 15 grouped histograms under
+`figures/kernel_spectra/`. Completed data and checkpoints are reused when the
+training command is restarted. Use one controller process per results
+directory; multi-GPU work is handled by `--num-gpus`.
 
 The notebook-sized float32 trajectories occupy about 115.6 GiB in total
 (7.7 GiB per condition); an atomic train-data save temporarily needs another
 7.6 GiB. Each active GPU worker also holds roughly one condition's data in CPU
-memory (about 31 GiB for four workers). The plotted target is the exact
-stationary ensemble EPR of one `dt=1e-2` Euler transition, evaluated
-analytically in Fourier space rather than from a sampled trajectory. The
-continuous-time `sigma * dt` reference remains available in the CSV files as
-`continuous_delta_s`; it is about 0.52--0.99% smaller on this grid and is not
-used as the plotted ground truth.
+memory (about 31 GiB for four workers). Both references are stored without
+sampling a trajectory: the exact stationary Euler-transition value and the
+continuous-time `sigma * dt` value. The visualization script uses the latter
+as the one-step theory because it is exactly linear in (A^2), matching the
+`Corr_SAOU.ipynb` convention.
