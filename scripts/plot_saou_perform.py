@@ -13,7 +13,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RESULTS_DIR = ROOT / "results" / "saou_perform"
-KERNEL_LABELS = ("local", "r=1", "r=2", "r=3", "r=4")
+KERNEL_LABELS = ("k=0", "k=1", "k=2", "k=3", "k=4")
 COLORS = ("#1f77b4", "#d95f02", "#2ca02c")
 MARKERS = ("o", "v", "^")
 
@@ -137,7 +137,7 @@ def _performance_figure(runs, figure_dir: Path, dpi: int, plt) -> None:
         frameon=True,
         fancybox=True,
         framealpha=0.9,
-        title="solid: theory; symbols: KNEEP",
+        title="solid: theory; symbols: predicted",
     )
     axis.margins(x=0.05, y=0.08)
     _style_axis(axis)
@@ -202,8 +202,8 @@ def _kernel_figures(kernel_runs, figure_dir: Path, dpi: int, plt) -> int:
                 for index in indices
             ],
         )
-        axis.set_xlabel("Shell / kernel distance")
-        axis.set_ylabel(r"EP contribution per saved step")
+        axis.set_xlabel("kernel $k$")
+        axis.set_ylabel(r"$\Delta S_k$")
         axis.set_title(
             rf"$A={float(first['amplitude']):g},\ "
             rf"d_w={float(first['d_w']):g}$"

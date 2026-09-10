@@ -41,8 +41,6 @@ from utils.training import (
 OUTPUT_DIR = ROOT / "results" / "saou_perform"
 DATA_DIR = OUTPUT_DIR / "data"
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
-FIGURE_DIR = OUTPUT_DIR / "figures"
-LOSS_FIGURE_DIR = FIGURE_DIR / "losses"
 KERNEL_NAMES = ("local", "r=1", "r=2", "r=3", "r=4")
 
 
@@ -272,7 +270,7 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 def _prepare(config: ExperimentConfig) -> str:
-    for path in (OUTPUT_DIR, DATA_DIR, CHECKPOINT_DIR, FIGURE_DIR, LOSS_FIGURE_DIR):
+    for path in (OUTPUT_DIR, DATA_DIR, CHECKPOINT_DIR):
         path.mkdir(parents=True, exist_ok=True)
     experiment_hash = _hash(config)
     path = OUTPUT_DIR / "config.json"
@@ -607,170 +605,6 @@ def _tables(config: ExperimentConfig, runs: list[dict[str, object]]):
     return kernel_runs, summary, kernel_summary
 
 
-def _pyplot():
-    mpl_dir = OUTPUT_DIR / ".matplotlib"
-    mpl_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["MPLCONFIGDIR"] = str(mpl_dir)
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    return plt
-
-
-def _draw_box(axis, values, position: float, width: float, color: str) -> None:
-    box = axis.boxplot(
-        [values],
-        positions=[position],
-        widths=width,
-        patch_artist=True,
-        manage_ticks=False,
-        showfliers=False,
-    )
-    box["boxes"][0].set(facecolor=color, edgecolor=color, alpha=0.25)
-    box["medians"][0].set(color=color, linewidth=2.0)
-    for item in (*box["whiskers"], *box["caps"]):
-        item.set(color=color, linewidth=1.2)
-    jitter = np.linspace(-0.18 * width, 0.18 * width, len(values))
-    axis.scatter(
-        position + jitter,
-        values,
-        s=14,
-        color=color,
-        alpha=0.65,
-        linewidths=0,
-        zorder=3,
-    )
-
-
-def _figures(config: ExperimentConfig, runs, summary, losses) -> None:
-    plt = _pyplot()
-    figure, axis = plt.subplots(figsize=(7.0, 5.0))
-    base_positions = np.arange(len(config.amplitudes), dtype=float)
-    group_width = 0.66
-    box_width = group_width / max(len(config.dws), 1) * 0.62
-    for di, d_w in enumerate(config.dws):
-        rows = sorted(
-            (row for row in summary if float(row["d_w"]) == float(d_w)),
-            key=lambda row: row["amplitude_squared"],
-        )
-        if not rows:
-            continue
-        offset = (di - 0.5 * (len(config.dws) - 1)) * (
-            group_width / len(config.dws)
-        )
-        positions = base_positions + offset
-        color = f"C{di}"
-        axis.plot(
-            positions,
-            [row["theoretical_delta_s"] for row in rows],
-            color=color,
-            linewidth=1.8,
-            label=rf"$d_w={d_w:g}$",
-        )
-        for position, row in zip(positions, rows):
-            predictions = [
-                float(run["predicted_delta_s"])
-                for run in runs
-                if run["condition_id"] == row["condition_id"]
-            ]
-            _draw_box(axis, predictions, position, box_width, color)
-    axis.set_xticks(
-        base_positions,
-        [f"{amplitude**2:g}" for amplitude in config.amplitudes],
-    )
-    axis.set_xlim(-0.55, len(config.amplitudes) - 0.45)
-    axis.set(
-        xlabel=r"$A^2$",
-        ylabel=r"EP per saved step $\langle\Delta S\rangle$",
-    )
-    axis.legend(
-        frameon=False,
-        title="solid: exact theory; boxes/points: 5 training seeds",
-    )
-    axis.grid(alpha=0.18)
-    figure.tight_layout()
-    figure.savefig(FIGURE_DIR / "a2_delta_s.png", dpi=300)
-    plt.close(figure)
-
-    kernel_dir = FIGURE_DIR / "kernel_decomposition"
-    kernel_dir.mkdir(parents=True, exist_ok=True)
-    kernel_positions = np.arange(len(KERNEL_NAMES), dtype=float)
-    for ai, di in _indices(config):
-        condition = _record(config, ai, di)
-        condition_runs = [
-            run for run in runs if run["condition_id"] == condition["condition_id"]
-        ]
-        if not condition_runs:
-            continue
-        figure, axis = plt.subplots(figsize=(6.6, 4.5))
-        for kernel_index, position in enumerate(kernel_positions):
-            predictions = [
-                float(run[f"predicted_k{kernel_index}_delta_s"])
-                for run in condition_runs
-            ]
-            _draw_box(axis, predictions, position, 0.42, "C0")
-        theory = [
-            condition[f"theoretical_k{index}_delta_s"]
-            for index in range(len(KERNEL_NAMES))
-        ]
-        axis.plot(
-            kernel_positions,
-            theory,
-            color="black",
-            marker="D",
-            linewidth=1.8,
-            markersize=4,
-            label="Exact Euler ensemble",
-            zorder=4,
-        )
-        axis.axhline(0.0, color="0.55", linewidth=0.8)
-        axis.set_xticks(kernel_positions, KERNEL_NAMES)
-        axis.set_ylabel(r"EP contribution per saved step")
-        axis.set_title(
-            rf"$A={condition['amplitude']:g},\ d_w={condition['d_w']:g}$"
-        )
-        axis.legend(frameon=False, title="boxes/points: training seeds")
-        axis.grid(axis="y", alpha=0.18)
-        figure.tight_layout()
-        figure.savefig(
-            kernel_dir / f"{condition['condition_id']}.png",
-            dpi=250,
-        )
-        plt.close(figure)
-
-    for ai, di in _indices(config):
-        condition = _record(config, ai, di)
-        rows = [r for r in losses if r["condition_id"] == condition["condition_id"]]
-        if not rows:
-            continue
-        figure, axes = plt.subplots(2, 1, figsize=(6.8, 6.2), sharex=True)
-        for repeat in range(config.repeats):
-            run = sorted(
-                (row for row in rows if int(row["repeat"]) == repeat + 1),
-                key=lambda row: row["iteration"],
-            )
-            if not run:
-                continue
-            x = [r["iteration"] for r in run]
-            label = f"seed {_training_seed(config, repeat)}"
-            axes[0].plot(x, [r["train_loss"] for r in run], label=label)
-            axes[1].plot(x, [r["validation_loss"] for r in run])
-        axes[0].set_ylabel("Raw train loss")
-        axes[1].set(xlabel="Iteration", ylabel="Validation loss")
-        axes[0].set_title(
-            rf"$A={condition['amplitude']:g},\ d_w={condition['d_w']:g}$ "
-            "(no smoothing)"
-        )
-        axes[0].legend(frameon=False, fontsize=8)
-        for axis in axes:
-            axis.grid(alpha=0.18)
-        figure.tight_layout()
-        figure.savefig(LOSS_FIGURE_DIR / f"{condition['condition_id']}.png", dpi=220)
-        plt.close(figure)
-
-
 def _write_outputs(config: ExperimentConfig, experiment_hash: str) -> int:
     runs, losses = _collect(config, experiment_hash)
     kernel_runs, summary, kernel_summary = _tables(config, runs)
@@ -780,8 +614,6 @@ def _write_outputs(config: ExperimentConfig, experiment_hash: str) -> int:
         ("kernel_summary", kernel_summary),
     ):
         _write_csv(OUTPUT_DIR / f"{name}.csv", rows)
-    if runs:
-        _figures(config, runs, summary, losses)
     return len(runs)
 
 
@@ -857,7 +689,7 @@ def run(config: ExperimentConfig, devices: tuple[torch.device, ...]) -> None:
     completed = _write_outputs(config, experiment_hash)
     if completed != total:
         raise RuntimeError(f"study ended with {completed}/{total} checkpoints")
-    print(f"Saved {total} checkpoints and figures under {OUTPUT_DIR}")
+    print(f"Saved {total} completed training runs and tables under {OUTPUT_DIR}")
 
 
 def _device(value: str) -> torch.device:

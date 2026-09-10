@@ -41,14 +41,13 @@ over training seeds, and the one-step continuous theory as solid straight
 lines. Kernel spectra follow the grouped-histogram style used in
 `Corr_SAOU.ipynb`.
 
-Outputs are written under `results/saou_perform/`: the 30 fixed trajectory
-files, 75 trained-model checkpoints, run/summary/kernel CSV files, unsmoothed
-loss histories and plots, and the derived figures. Running
-`plot_saou_perform.py` replaces `figures/a2_delta_s.png` with the
-publication-style error-bar version and writes 15 grouped histograms under
-`figures/kernel_spectra/`. Completed data and checkpoints are reused when the
-training command is restarted. Use one controller process per results
-directory; multi-GPU work is handled by `--num-gpus`.
+`saou_perform.py` writes the 30 fixed trajectory files, 75 trained-model
+checkpoints, run/summary/kernel CSV files, and unsmoothed loss histories under
+`results/saou_perform/`; it does not create figures. `plot_saou_perform.py`
+creates the publication-style `figures/a2_delta_s.png` and 15 grouped
+histograms under `figures/kernel_spectra/`. Completed data and checkpoints are
+reused when the training command is restarted. Use one controller process per
+results directory; multi-GPU work is handled by `--num-gpus`.
 
 The notebook-sized float32 trajectories occupy about 115.6 GiB in total
 (7.7 GiB per condition); an atomic train-data save temporarily needs another
