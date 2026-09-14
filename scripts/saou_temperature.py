@@ -1,4 +1,4 @@
-"""Train the SAOU temperature sweep and create its publication figures."""
+"""Train the SAOU temperature sweep and save trajectories and result tables."""
 
 from __future__ import annotations
 
@@ -42,8 +42,7 @@ from utils.training import (
 
 OUTPUT_DIR = ROOT / "results" / "saou_temperature"
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
-FIGURE_DIR = OUTPUT_DIR / "figures"
-SPECTRUM_DIR = FIGURE_DIR / "kernel_spectra"
+DATA_DIR = OUTPUT_DIR / "data"
 KERNEL_NAMES = ("local", "r=1", "r=2", "r=3", "r=4")
 
 CONDITION_FIELDS = (
@@ -79,6 +78,8 @@ RUN_FIELDS = (
     "predicted_k3_rate",
     "predicted_k4_rate",
     "n_test_transitions",
+    "train_data",
+    "test_data",
     "checkpoint",
     "elapsed_seconds",
 )
@@ -93,32 +94,33 @@ class ParameterSet:
 @dataclass(frozen=True)
 class ExperimentConfig:
     parameters: tuple[ParameterSet, ...] = (
-        ParameterSet(3.0, (0.0, 1.0, 1.0, 0.0)),
-        ParameterSet(4.0, (1.0, 2.0, 0.0, 1.0)),
-        ParameterSet(2.0, (0.0, 1.0, 0.0, 1.0)),
+        # Original couplings scaled by 0.3.
+        ParameterSet(0.9, (0.0, 0.3, 0.3, 0.0)),
+        ParameterSet(1.2, (0.3, 0.6, 0.0, 0.3)),
+        ParameterSet(0.6, (0.0, 0.3, 0.0, 0.3)),
     )
     temperatures: tuple[float, ...] = (0.1, 0.3, 1.0, 3.0, 10.0)
-    repeats: int = 40
-    base_data_seed: int = 3
-    base_training_seed: int = 100_003
-    train_trajectories: int = 100
+    repeats: int = 5
+    base_data_seed: int = 5
+    base_training_seed: int = 5
+    train_trajectories: int = 1_000
     train_samples: int = 1_000
     test_trajectories: int = 1
     test_samples: int = 10_000
     burn_steps: int = 10_000
-    hidden_channels: int = 16
+    hidden_channels: int = 64
     hidden_layers: int = 3
-    activation: str = "relu"
+    activation: str = "elu"
     saou: SAOUConfig = field(default_factory=SAOUConfig)
     training: TrainingConfig = field(
         default_factory=lambda: TrainingConfig(
             alpha=-0.5,
-            iterations=5_000,
-            train_batch_size=4_096,
-            validation_batch_size=2_048,
+            iterations=3_000,
+            train_batch_size=512,
+            validation_batch_size=512,
             prediction_batch_size=256,
-            learning_rate=1e-2,
-            weight_decay=1e-3,
+            learning_rate=1e-3,
+            weight_decay=1e-4,
             gradient_clip=1.0,
             validate_every=100,
             train_fraction=0.8,
@@ -178,8 +180,10 @@ def _data_seeds(
     config: ExperimentConfig, parameter_index: int, temperature_index: int
 ) -> tuple[int, int]:
     condition_number = _condition_number(config, parameter_index, temperature_index)
-    train_seed = config.base_data_seed + 2 * condition_number
-    return train_seed, train_seed + 1
+    train_seed = config.base_data_seed + condition_number * (
+        config.train_trajectories + config.test_trajectories
+    )
+    return train_seed, train_seed + config.train_trajectories
 
 
 def _training_seed(
@@ -188,8 +192,7 @@ def _training_seed(
     temperature_index: int,
     repeat_index: int,
 ) -> int:
-    condition_number = _condition_number(config, parameter_index, temperature_index)
-    return config.base_training_seed + condition_number * config.repeats + repeat_index
+    return config.base_training_seed + repeat_index
 
 
 def _condition_saou(
@@ -212,10 +215,10 @@ def _scientific_payload(config: ExperimentConfig) -> dict[str, object]:
     )
     payload["seed_rules"] = {
         "condition_number": "parameter_index * n_temperatures + temperature_index",
-        "train_data_seed": "base_data_seed + 2 * condition_number",
-        "test_data_seed": "train_data_seed + 1",
+        "train_data_seed": "base_data_seed + condition_number * (train_trajectories + test_trajectories)",
+        "test_data_seed": "train_data_seed + train_trajectories",
         "training_seed": (
-            "base_training_seed + condition_number * repeats + repeat_index"
+            "base_training_seed + repeat_index"
         ),
     }
     payload["theory"] = (
@@ -307,7 +310,7 @@ def _prepare_output(
 ) -> str:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    SPECTRUM_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     scientific = _scientific_payload(config)
     experiment_hash = _experiment_hash(scientific)
     source_hashes = _source_hashes()
@@ -410,6 +413,8 @@ def _checkpoint_row(
             for index, value in enumerate(metrics["predicted_kernel_epr_rates"])
         },
         "n_test_transitions": checkpoint["n_test_transitions"],
+        "train_data": checkpoint["data_files"]["train"],
+        "test_data": checkpoint["data_files"]["test"],
         "checkpoint": checkpoint_name,
         "elapsed_seconds": checkpoint["elapsed_seconds"],
     }
@@ -461,6 +466,85 @@ def _atomic_save_checkpoint(path: Path, checkpoint: dict[str, object]) -> None:
     temporary.replace(path)
 
 
+def _relative(path: Path) -> str:
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _load(path: Path, mmap: bool = False):
+    kwargs = {"map_location": "cpu", "weights_only": True}
+    if mmap:
+        kwargs["mmap"] = True
+    try:
+        return torch.load(path, **kwargs)
+    except TypeError:
+        kwargs.pop("weights_only", None)
+        try:
+            return torch.load(path, **kwargs)
+        except TypeError:
+            kwargs.pop("mmap", None)
+            return torch.load(path, **kwargs)
+
+
+def _data_path(config: ExperimentConfig, ai: int, di: int, role: str) -> Path:
+    return (DATA_DIR / f"p{ai + 1:02d}"
+            / f"T_{_temperature_token(config.temperatures[di])}" / f"{role}.pt")
+
+
+def _trajectory(
+    config: ExperimentConfig,
+    experiment_hash: str,
+    ai: int,
+    di: int,
+    role: str,
+    device: torch.device,
+) -> torch.Tensor:
+    path = _data_path(config, ai, di, role)
+    n_trajectories, n_samples = (
+        (config.train_trajectories, config.train_samples)
+        if role == "train"
+        else (config.test_trajectories, config.test_samples)
+    )
+    seed = _data_seeds(config, ai, di)[role == "test"]
+    condition = _condition_id(ai, di)
+    if path.exists():
+        payload = _load(path, mmap=True)
+        expected_metadata = {
+            "format_version": 1, "experiment_sha256": experiment_hash,
+            "condition_id": condition, "role": role, "seed": seed,
+        }
+        if not isinstance(payload, dict) or any(
+            payload.get(key) != value for key, value in expected_metadata.items()
+        ):
+            raise RuntimeError(f"trajectory metadata mismatch: {path}")
+        trajectories = payload.get("trajectories")
+    else:
+        print(f"[{condition}] generating fixed {role} trajectories on {device}", flush=True)
+        trajectories = simulate_trajectories(
+            _condition_saou(config, ai, di),
+            n_trajectories=n_trajectories,
+            n_samples=n_samples,
+            burn_steps=config.burn_steps,
+            seed=seed,
+            simulation_device=device,
+            storage_dtype=torch.float32,
+        )
+        payload = {
+            "format_version": 1, "experiment_sha256": experiment_hash,
+            "condition_id": condition, "role": role, "seed": seed,
+            "trajectories": trajectories,
+        }
+        _atomic_save_checkpoint(path, payload)
+    expected = (n_trajectories, n_samples, 2, config.saou.lattice_size, config.saou.lattice_size)
+    if not isinstance(trajectories, torch.Tensor) or tuple(trajectories.shape) != expected:
+        raise RuntimeError(f"invalid trajectory tensor: {path}")
+    if trajectories.dtype != torch.float32:
+        raise RuntimeError(f"invalid trajectory dtype: {path}")
+    return trajectories
+
+
 def _run_condition(
     config: ExperimentConfig,
     experiment_hash: str,
@@ -475,35 +559,29 @@ def _run_condition(
             config, parameter_index, temperature_index, repeat_index
         ).exists()
     ]
+    missing_data = [
+        _data_path(config, parameter_index, temperature_index, role)
+        for role in ("train", "test")
+        if not _data_path(config, parameter_index, temperature_index, role).exists()
+    ]
+    if len(pending) < config.repeats and missing_data:
+        raise RuntimeError(
+            "trajectory data are missing for existing checkpoints: "
+            + ", ".join(map(str, missing_data))
+        )
     if not pending:
         return 0
     condition = _condition_record(config, parameter_index, temperature_index)
     saou = _condition_saou(config, parameter_index, temperature_index)
-    print(
-        f"[{condition['condition_id']}] generating fixed train/test data on {device}",
-        flush=True,
-    )
-    train_data = simulate_trajectories(
-        saou,
-        n_trajectories=config.train_trajectories,
-        n_samples=config.train_samples,
-        burn_steps=config.burn_steps,
-        seed=int(condition["train_data_seed"]),
-        simulation_device=device,
-        storage_dtype=torch.float32,
+    train_data = _trajectory(
+        config, experiment_hash, parameter_index, temperature_index, "train", device
     )
     train_video, validation_video = _split_train_validation(
         train_data, config.training.train_fraction
     )
     normalization = channel_normalization(train_video)
-    test_video = simulate_trajectories(
-        saou,
-        n_trajectories=config.test_trajectories,
-        n_samples=config.test_samples,
-        burn_steps=config.burn_steps,
-        seed=int(condition["test_data_seed"]),
-        simulation_device=device,
-        storage_dtype=torch.float32,
+    test_video = _trajectory(
+        config, experiment_hash, parameter_index, temperature_index, "test", device
     )
     theoretical_components = np.asarray(
         [condition[f"theoretical_k{index}_rate"] for index in range(5)],
@@ -583,6 +661,10 @@ def _run_condition(
                 "predicted_kernel_epr_rates": branch_rates.tolist(),
                 "theoretical_kernel_epr_rates": theoretical_components.tolist(),
             },
+            "data_files": {
+                role: _relative(_data_path(config, parameter_index, temperature_index, role))
+                for role in ("train", "test")
+            },
             "n_test_transitions": int(branch_increments.shape[0]),
             "elapsed_seconds": time.perf_counter() - started,
         }
@@ -632,6 +714,9 @@ def _condition_is_complete(
     config: ExperimentConfig, parameter_index: int, temperature_index: int
 ) -> bool:
     return all(
+        _data_path(config, parameter_index, temperature_index, role).exists()
+        for role in ("train", "test")
+    ) and all(
         _checkpoint_path(config, parameter_index, temperature_index, repeat_index).exists()
         for repeat_index in range(config.repeats)
     )
@@ -770,151 +855,27 @@ def _write_summaries(
     return summary, kernel_summary
 
 
-def _matplotlib_pyplot():
-    config_dir = OUTPUT_DIR / ".matplotlib"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(config_dir))
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    return plt
-
-
-def _make_figures(
-    config: ExperimentConfig,
-    summary: list[dict[str, object]],
-    kernel_summary: list[dict[str, object]],
-) -> None:
-    plt = _matplotlib_pyplot()
-    colors = ("tab:blue", "tab:orange", "tab:green")
-    markers = ("o", "v", "s")
-    figure, axes = plt.subplots(2, 1, figsize=(7.4, 8.2), sharex=True)
-    for parameter_index, parameters in enumerate(config.parameters):
-        selected = [
-            row
-            for row in summary
-            if int(row["parameter_index"]) == parameter_index + 1
-        ]
-        selected.sort(key=lambda row: float(row["temperature"]))
-        if not selected:
-            continue
-        x = np.asarray([float(row["temperature"]) for row in selected])
-        predicted = np.asarray([float(row["predicted_epr_mean"]) for row in selected])
-        predicted_std = np.asarray(
-            [float(row["predicted_epr_std"]) for row in selected]
-        )
-        theory = np.asarray([float(row["theoretical_epr_rate"]) for row in selected])
-        ratio = np.asarray(
-            [float(row["predicted_over_theoretical_mean"]) for row in selected]
-        )
-        ratio_std = np.asarray(
-            [float(row["predicted_over_theoretical_std"]) for row in selected]
-        )
-        amplitude_text = ",".join(f"{value:g}" for value in parameters.amplitudes)
-        label = rf"$P_{parameter_index + 1}=({parameters.omega0:g},{amplitude_text})$"
-        axes[0].plot(x, theory, color=colors[parameter_index], linewidth=2.0)
-        axes[0].errorbar(
-            x,
-            predicted,
-            yerr=predicted_std,
-            color=colors[parameter_index],
-            marker=markers[parameter_index],
-            linestyle="--",
-            linewidth=1.5,
-            capsize=3,
-            label=label,
-        )
-        axes[1].errorbar(
-            x,
-            ratio,
-            yerr=ratio_std,
-            color=colors[parameter_index],
-            marker=markers[parameter_index],
-            linestyle="--",
-            linewidth=1.5,
-            capsize=3,
-        )
-    axes[0].set_ylabel(r"Entropy production rate $\sigma$")
-    axes[0].legend(
-        frameon=False,
-        title=r"solid: theory; markers: KNEEP ($\alpha=-0.5$)",
-    )
-    axes[1].axhline(1.0, color="0.55", linestyle="--", linewidth=1.5)
-    axes[1].set_xscale("log")
-    axes[1].set_xlabel(r"Temperature $T$")
-    axes[1].set_ylabel(r"$\sigma_{\rm pred}/\sigma_{\rm true}$")
-    for axis in axes:
-        axis.grid(alpha=0.18, which="both")
-    figure.tight_layout()
-    figure.savefig(FIGURE_DIR / "temperature_performance.png", dpi=300)
-    plt.close(figure)
-
-    for parameter_index, temperature_index in _condition_indices(config):
-        selected = [
-            row
-            for row in kernel_summary
-            if int(row["parameter_index"]) == parameter_index + 1
-            and int(row["temperature_index"]) == temperature_index + 1
-        ]
-        selected.sort(key=lambda row: int(row["kernel_index"]))
-        if len(selected) != len(KERNEL_NAMES):
-            continue
-        theory = np.asarray([float(row["theoretical_epr_rate"]) for row in selected])
-        predicted = np.asarray([float(row["predicted_epr_mean"]) for row in selected])
-        predicted_std = np.asarray([float(row["predicted_epr_std"]) for row in selected])
-        x = np.arange(len(KERNEL_NAMES))
-        figure, axis = plt.subplots(figsize=(6.6, 4.4))
-        width = 0.36
-        axis.bar(
-            x - width / 2,
-            theory,
-            width,
-            facecolor="white",
-            edgecolor="black",
-            linewidth=1.2,
-            label="Theory",
-        )
-        axis.bar(
-            x + width / 2,
-            predicted,
-            width,
-            yerr=predicted_std,
-            color="tab:blue",
-            alpha=0.8,
-            capsize=3,
-            label="KNEEP",
-        )
-        parameters = config.parameters[parameter_index]
-        temperature = config.temperatures[temperature_index]
-        parameter_text = ", ".join(
-            f"{value:g}" for value in (parameters.omega0, *parameters.amplitudes)
-        )
-        axis.set_title(
-            rf"$P_{parameter_index + 1}=({parameter_text}),\quad T={temperature:g}$"
-        )
-        axis.set_xticks(x, KERNEL_NAMES)
-        axis.set_ylabel("Kernel EPR rate")
-        axis.axhline(0.0, color="0.35", linewidth=0.8)
-        axis.legend(frameon=False)
-        axis.grid(axis="y", alpha=0.18)
-        figure.tight_layout()
-        figure.savefig(
-            SPECTRUM_DIR
-            / f"p{parameter_index + 1:02d}_T_{_temperature_token(temperature)}.png",
-            dpi=300,
-        )
-        plt.close(figure)
-
-
 def _write_derived_outputs(
-    config: ExperimentConfig, rows: list[dict[str, object]], make_figures: bool
+    config: ExperimentConfig, rows: list[dict[str, object]]
 ) -> None:
     _write_run_tables(rows)
-    summary, kernel_summary = _write_summaries(config, rows)
-    if make_figures:
-        _make_figures(config, summary, kernel_summary)
+    _write_summaries(config, rows)
+    fields = (
+        "condition_id", "parameter_index", "temperature_index", "temperature",
+        "repeat", "training_seed", "iteration", "train_loss", "validation_loss",
+    )
+    losses = []
+    for row in rows:
+        history = _load_checkpoint(ROOT / str(row["checkpoint"]))["history"]
+        base = {key: row[key] for key in fields[:6]}
+        for iteration, train_loss, validation_loss in zip(
+            history["iterations"], history["train_loss"], history["validation_loss"]
+        ):
+            losses.append({
+                **base, "iteration": iteration, "train_loss": train_loss,
+                "validation_loss": validation_loss,
+            })
+    _atomic_write_csv(OUTPUT_DIR / "loss_history.csv", fields, losses)
 
 
 def _allocated_cpu_threads(n_workers: int) -> int:
@@ -938,7 +899,7 @@ def _run_serial(
             device,
         )
         rows = _collect_rows(config, experiment_hash)
-        _write_derived_outputs(config, rows, make_figures=False)
+        _write_derived_outputs(config, rows)
 
 
 def _run_parallel(
@@ -995,7 +956,7 @@ def _run_parallel(
                     flush=True,
                 )
                 rows = _collect_rows(config, experiment_hash)
-                _write_derived_outputs(config, rows, make_figures=False)
+                _write_derived_outputs(config, rows)
                 submit(worker_index)
     finally:
         for executor in executors:
@@ -1008,7 +969,7 @@ def run(config: ExperimentConfig, devices: tuple[torch.device, ...]) -> None:
         raise ValueError("at least one device is required")
     experiment_hash = _prepare_output(config, devices)
     rows = _collect_rows(config, experiment_hash)
-    _write_derived_outputs(config, rows, make_figures=False)
+    _write_derived_outputs(config, rows)
     pending = [
         condition
         for condition in _condition_indices(config)
@@ -1030,10 +991,13 @@ def run(config: ExperimentConfig, devices: tuple[torch.device, ...]) -> None:
         f"Conditions: {len(config.parameters)} x {len(config.temperatures)}; "
         f"trainings: {total_trainings}; completed: {len(rows)}"
     )
-    print(f"Fixed trajectory storage per worker: {stored_gib:.2f} GiB")
+    print(
+        f"Trajectory storage: {stored_gib:.2f} GiB per condition; "
+        f"{stored_gib * len(config.parameters) * len(config.temperatures):.1f} GiB total"
+    )
     print(f"Output: {OUTPUT_DIR}")
     if any(device.type == "cpu" for device in devices):
-        print("WARNING: the full 600-training sweep is intended for CUDA.")
+        print("WARNING: the full temperature sweep is intended for CUDA.")
     if len(devices) == 1:
         _run_serial(config, experiment_hash, devices[0], pending)
     else:
@@ -1043,12 +1007,8 @@ def run(config: ExperimentConfig, devices: tuple[torch.device, ...]) -> None:
         raise RuntimeError(
             f"sweep ended with {len(rows)}/{total_trainings} checkpoints"
         )
-    _write_derived_outputs(config, rows, make_figures=True)
-    figure_count = 1 + len(config.parameters) * len(config.temperatures)
-    print(
-        f"Saved tables, {total_trainings} checkpoints, and "
-        f"{figure_count} figures under {OUTPUT_DIR}"
-    )
+    _write_derived_outputs(config, rows)
+    print(f"Saved tables and {total_trainings} checkpoints under {OUTPUT_DIR}")
 
 
 def _device_from_argument(value: str) -> torch.device:

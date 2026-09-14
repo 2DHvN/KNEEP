@@ -78,10 +78,10 @@ class ExperimentConfig:
         default_factory=lambda: TrainingConfig(
             alpha=-0.5,
             iterations=3_000,
-            train_batch_size=2_048,
-            validation_batch_size=2_048,
+            train_batch_size=512,
+            validation_batch_size=512,
             prediction_batch_size=256,
-            learning_rate=3e-3,
+            learning_rate=1e-3,
             weight_decay=1e-4,
             gradient_clip=1.0,
             validate_every=100,

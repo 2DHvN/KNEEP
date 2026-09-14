@@ -125,19 +125,18 @@ def _performance_figure(runs, figure_dir: Path, dpi: int, plt) -> None:
             elinewidth=1.5,
             capsize=4,
             capthick=1.4,
-            label=rf"$d_w={d_w:g}$",
+            label=rf"$\delta_\omega={d_w:g}$",
             zorder=3,
         )
 
     axis.set_xticks(amplitude_squared)
     axis.set_xlabel(r"$A^2$")
-    axis.set_ylabel(r"EP per saved step $\langle\Delta S\rangle$")
+    axis.set_ylabel(r"$\langle\Delta S\rangle$")
     axis.legend(
         loc="upper left",
         frameon=True,
         fancybox=True,
-        framealpha=0.9,
-        title="solid: theory; symbols: predicted",
+        framealpha=0.9
     )
     axis.margins(x=0.05, y=0.08)
     _style_axis(axis)
@@ -202,11 +201,11 @@ def _kernel_figures(kernel_runs, figure_dir: Path, dpi: int, plt) -> int:
                 for index in indices
             ],
         )
-        axis.set_xlabel("kernel $k$")
-        axis.set_ylabel(r"$\Delta S_k$")
+        axis.set_xlabel("Kernel $k$")
+        axis.set_ylabel(r"$\langle\Delta S_k\rangle$")
         axis.set_title(
             rf"$A={float(first['amplitude']):g},\ "
-            rf"d_w={float(first['d_w']):g}$"
+            rf"\delta_\omega={float(first['d_w']):g}$"
         )
         axis.axhline(0.0, color="black", linewidth=0.8)
         axis.legend(frameon=False)

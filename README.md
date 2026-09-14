@@ -1,59 +1,25 @@
 # KNEEP
 
-Minimal research code for the figures used in the KNEEP study.
+Run from the parent workspace.
 
-```text
-KNEEP/
-├── shell_force.py  # periodic shell-force KNEEP estimator
-├── results/        # generated data and figures
-├── models/         # physical models (SAOU, later LABP)
-├── utils/          # training utilities
-├── demos/          # focused demonstrations
-└── scripts/        # reproducible figure runs
-```
-
-The focused SAOU performance experiment uses
-
-```text
-A = 0.1, 0.2, 0.3, 0.4, 0.5
-d_w = 0.0, 0.1, 0.2
-a_r = A / sqrt(r),  w_0 = sum_r(a_r) + d_w,  T = 1
-```
-
-with one fixed train/test dataset per condition and five training seeds
-(`alpha=-0.5`). The remaining simulation and learning settings come from the
-current `Corr_SAOU.ipynb`. From the parent workspace, run either:
+Train:
 
 ```bash
 python KNEEP/scripts/saou_perform.py
-python KNEEP/scripts/saou_perform.py --num-gpus 2
+python KNEEP/scripts/saou_temperature.py
 ```
 
-To redraw completed results without loading trajectories or models:
+For multiple GPUs, add `--num-gpus 2`; for CPU, add `--device cpu`.
+Rerun the same command to resume.
+
+Plot saved results:
 
 ```bash
 python KNEEP/scripts/plot_saou_perform.py
+python KNEEP/scripts/plot_saou_temperature.py
 ```
 
-This reads only `runs.csv` and `kernel_runs.csv`. The performance plot uses
-the actual A-squared coordinates, mean and sample-standard-deviation error bars
-over training seeds, and the one-step continuous theory as solid straight
-lines. Kernel spectra follow the grouped-histogram style used in
-`Corr_SAOU.ipynb`.
-
-`saou_perform.py` writes the 30 fixed trajectory files, 75 trained-model
-checkpoints, run/summary/kernel CSV files, and unsmoothed loss histories under
-`results/saou_perform/`; it does not create figures. `plot_saou_perform.py`
-creates the publication-style `figures/a2_delta_s.png` and 15 grouped
-histograms under `figures/kernel_spectra/`. Completed data and checkpoints are
-reused when the training command is restarted. Use one controller process per
-results directory; multi-GPU work is handled by `--num-gpus`.
-
-The notebook-sized float32 trajectories occupy about 115.6 GiB in total
-(7.7 GiB per condition); an atomic train-data save temporarily needs another
-7.6 GiB. Each active GPU worker also holds roughly one condition's data in CPU
-memory (about 31 GiB for four workers). Both references are stored without
-sampling a trajectory: the exact stationary Euler-transition value and the
-continuous-time `sigma * dt` value. The visualization script uses the latter
-as the one-step theory because it is exactly linear in (A^2), matching the
-`Corr_SAOU.ipynb` convention.
+Results are saved under `KNEEP/results/saou_perform/` and
+`KNEEP/results/saou_temperature/`, with plots in each `figures/` directory.
+Both plot commands accept `--results-dir PATH` and `--dpi 300`.
+Move previous results aside before training with changed experiment settings.
