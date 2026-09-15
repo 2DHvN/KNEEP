@@ -45,6 +45,9 @@ def _make_figures(
     figure_dir: Path,
     dpi: int,
 ) -> None:
+    dt = config.dt
+    if not np.isfinite(dt) or dt <= 0:
+        raise ValueError("saved simulation dt must be positive and finite")
     plt = _pyplot(results_dir)
     spectrum_dir = figure_dir / "kernel_spectra"
     spectrum_dir.mkdir(parents=True, exist_ok=True)
@@ -64,6 +67,9 @@ def _make_figures(
             [float(row["predicted_epr_std"]) for row in selected]
         )
         theory = np.asarray([float(row["theoretical_epr_rate"]) for row in selected])
+        predicted *= dt
+        predicted_std *= dt
+        theory *= dt
         amplitude_text = ",".join(f"{value:g}" for value in parameters.amplitudes)
         label = rf"$P_{parameter_index + 1}=({parameters.omega0:g},{amplitude_text})$"
         color = COLORS[parameter_index % len(COLORS)]
@@ -88,11 +94,11 @@ def _make_figures(
         )
     axis.set_xscale("log")
     axis.set_xticks(config.temperatures, [f"{value:g}" for value in config.temperatures])
-    axis.set_xlabel(r"Temperature $T$")
-    axis.set_ylabel(r"Entropy production rate $\sigma$")
+    axis.set_xlabel(r"$T$")
+    axis.set_ylabel(r"$\langle\Delta S\rangle$")
     axis.legend(
         loc="best", frameon=True, fancybox=True, framealpha=0.9,
-        title="Solid: theory; markers: KNEEP",
+        title=None,
     )
     axis.margins(x=0.05, y=0.08)
     _style_axis(axis)
@@ -114,6 +120,9 @@ def _make_figures(
         theory = np.asarray([float(row["theoretical_epr_rate"]) for row in selected])
         predicted = np.asarray([float(row["predicted_epr_mean"]) for row in selected])
         predicted_std = np.asarray([float(row["predicted_epr_std"]) for row in selected])
+        theory *= dt
+        predicted *= dt
+        predicted_std *= dt
         x = np.arange(len(KERNEL_NAMES))
         figure, axis = plt.subplots(figsize=(6.4, 4.4))
         width = 0.36
@@ -146,7 +155,7 @@ def _make_figures(
         )
         axis.set_xticks(x, KERNEL_LABELS)
         axis.set_xlabel("Kernel $k$")
-        axis.set_ylabel(r"Kernel EPR rate $\sigma_k$")
+        axis.set_ylabel(r"$\langle\Delta S_k\rangle$")
         axis.axhline(0.0, color="black", linewidth=0.8)
         axis.legend(frameon=False)
         _style_axis(axis)
@@ -167,6 +176,7 @@ def run(results_dir: Path = DEFAULT_RESULTS_DIR, figure_dir: Path | None = None,
     config = SimpleNamespace(
         parameters=[SimpleNamespace(**item) for item in payload["parameters"]],
         temperatures=payload["temperatures"],
+        dt=float(payload["saou"]["dt"]),
     )
     summary = _read_csv(results_dir / "summary.csv")
     kernel_summary = _read_csv(results_dir / "kernel_summary.csv")
