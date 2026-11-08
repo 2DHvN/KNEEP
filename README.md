@@ -140,3 +140,27 @@ AMB force. The refined settings do not resolve that architectural restriction
 or guarantee agreement with the medium reference. For the inference and
 sampling assumptions, see [Otsubo et al. (2022)](https://www.nature.com/articles/s42005-021-00787-x)
 and [Kwon and Baek (2024)](https://doi.org/10.1103/PhysRevE.109.014143).
+
+### Kernel-shell assertion after a long burn-in
+
+Update both sibling solver files, `LRAMB/lramb/model.py` and
+`LRAMB/lramb/torch_backend.py`, together with this generator. The Euler step
+now restores Hermitian symmetry before carrying its Fourier state to the next
+step. Previously, anti-Hermitian roundoff could be discarded in the real field
+while continuing to grow in the stored spectrum during spinodal evolution.
+This makes spectral shell energies inconsistent with the midpoint EP computed
+on real fields. In rFFT storage, the projection concerns the zero and Nyquist
+columns; the other columns already encode their missing conjugate partners.
+See the [PyTorch inverse real FFT requirements](https://docs.pytorch.org/docs/2.9/generated/torch.fft.irfft2.html).
+
+The integrator is still Euler–Maruyama and entropy still uses the midpoint of
+each solver step. The shell reconstruction tolerance is unchanged. Restart
+the notebook kernel after updating the files and regenerate into a fresh
+directory, for example by setting the following in the configuration cell:
+
+```python
+OUTPUT_DIR = KNEEP_ROOT / "results" / "lramb_poisson_range" / "refined_fft_fixed"
+```
+
+Existing caches have different solver/generator signatures and are not reused.
+The fix has not been exercised on the reporting remote CUDA environment.

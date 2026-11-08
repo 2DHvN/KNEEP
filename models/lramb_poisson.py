@@ -464,7 +464,13 @@ def generate_datasets(config: DatasetConfig, output_dir: str | Path,
                 kernel_multiplier_sha256=multiplier_hash)
             # The quadratic shell identity must reconstruct the full reference.
             torch.testing.assert_close(payload["reference_branch_increment"].sum(-1),
-                                       payload["reference_increment"].sum(-1), atol=1e-8, rtol=1e-9)
+                                       payload["reference_increment"].sum(-1), atol=1e-8, rtol=1e-9,
+                                       msg=lambda detail: (
+                                           "Kernel-shell EP does not reconstruct midpoint medium EP. "
+                                           "Update LRAMB/lramb/model.py and torch_backend.py to the "
+                                           "Hermitian-projected Euler step and regenerate in a new "
+                                           "output directory. Increasing the tolerance would conceal "
+                                           "a Fourier/real-field energy inconsistency.\n" + detail))
             torch.testing.assert_close(payload["reference_map"].sum((-2, -1)) * config.dx ** 2,
                                        payload["reference_increment"].sum(1) / config.duration,
                                        atol=1e-9, rtol=1e-9)
