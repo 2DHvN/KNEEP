@@ -57,10 +57,18 @@ def fit_preset(name: str) -> FitConfig:
         )
     if name == "demo":
         return FitConfig()
+    if name == "refined":
+        # Tune sampling/optimization without changing the force function class.
+        # Full validation is larger at sample_every=1, so evaluate less often.
+        return FitConfig(training=TrainingConfig(
+            iterations=20_000, train_batch_size=128, validation_batch_size=128,
+            prediction_batch_size=64, learning_rate=3e-4, weight_decay=1e-5,
+            validate_every=500,
+        ))
     if name == "reference":
         return FitConfig(hidden_layers=3, repeats=5,
             training=replace(FitConfig().training, iterations=5_000))
-    raise ValueError("preset must be quick, demo or reference")
+    raise ValueError("preset must be quick, demo, refined or reference")
 
 
 def _device(value: str | torch.device) -> torch.device:
@@ -344,7 +352,7 @@ def _save_summary(folder: Path, records: list[dict]) -> None:
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("generate", "train", "evaluate", "plot"))
-    parser.add_argument("--preset", choices=("quick", "demo", "reference"), default="demo")
+    parser.add_argument("--preset", choices=("quick", "demo", "refined", "reference"), default="demo")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--lramb-root", type=Path)
     parser.add_argument("--device", default="cpu", help="cpu, cuda, or auto")

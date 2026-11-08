@@ -61,6 +61,7 @@ completed repeats.
 | --- | --- | --- | --- | --- |
 | `quick` | 8 × 8 | 16 / 64 | 1 | 2 × 4 iterations |
 | `demo` | 32 × 32 | 4,000 / 8,192 | 8 | 3 × 2,000 iterations |
+| `refined` (notebook default) | 32 × 32 | 16,000 / 8,192 | 1 | 3 × 20,000 iterations |
 | `reference` | 64 × 64 | 40,000 / 64,000 | 40 | 5 × 5,000 iterations |
 
 `quick` checks execution only. `demo` makes the complete workflow accessible;
@@ -93,3 +94,49 @@ so a monotonic EP increase is not assumed. Training-seed spread measures fitting
 variation conditional on fixed data; repeat the data sweep with independent
 seeds and inspect structural drift before making a stationary or significance
 claim.
+
+### Next run after the 10,000-iteration comparison
+
+The notebook now selects `refined`, a new result directory. This is a proposed
+next configuration; its simulation and training have not been run. The supplied
+curves show similar validation losses across fit seeds and little late training
+improvement, alongside learned cumulative EP below the full-step medium
+reference. The exact configuration used for those supplied figures is not saved
+locally, so the changes below compare against the repository's `demo` preset.
+
+| Setting | `demo` | `refined` |
+| --- | --- | --- |
+| Observation stride / interval | 8 steps / 0.08 | 1 step / 0.01 |
+| Burn time / production time | 40 / 81.92 | 160 / 81.92 |
+| Independent train / validation / test trajectories | 4 / 2 / 3 | 8 / 4 / 4 |
+| Training batch | 32 | 128 |
+| AdamW learning rate / weight decay | 1e-3 / 1e-4 | 3e-4 / 1e-5 |
+| Optimizer iterations | 2,000 | 20,000 |
+| Full validation every | 100 iterations | 500 iterations |
+
+Both use the same physical parameters, grid, radius 8, width 32, depth 2,
+ELU, alpha=-0.5 and three fit seeds. More frequent observations address missing
+sub-sampling dynamics; larger batches and a lower learning rate address noisy
+optimization. Longer burn-in and more independent trajectories improve the next
+stationarity/generalization check without establishing convergence by themselves.
+The larger saved dataset also makes each full validation pass more expensive.
+
+```bash
+python KNEEP/scripts/lramb_poisson_range.py generate --preset refined
+python KNEEP/scripts/lramb_poisson_range.py train --preset refined --device auto
+python KNEEP/scripts/lramb_poisson_range.py evaluate --preset refined --device auto
+```
+
+Results go to `KNEEP/results/lramb_poisson_range/refined/`. Reopen the notebook
+kernel and run its cells in order to use the new preset. Its previous quick-run
+outputs were cleared when changing the default configuration.
+
+At stationarity the mean system-entropy boundary increment vanishes. A sustained
+mean-rate gap therefore cannot be assigned solely to system entropy. Finite
+observation intervals, nonstationarity, discrete-time errors and the restricted
+force family also matter. Each nonlocal branch sees only its own shell, so the
+additive branches cannot in general express center-neighbor products in the
+AMB force. The refined settings do not resolve that architectural restriction
+or guarantee agreement with the medium reference. For the inference and
+sampling assumptions, see [Otsubo et al. (2022)](https://www.nature.com/articles/s42005-021-00787-x)
+and [Kwon and Baek (2024)](https://doi.org/10.1103/PhysRevE.109.014143).

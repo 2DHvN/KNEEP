@@ -124,17 +124,23 @@ class DatasetConfig:
 
 
 def dataset_preset(name: str = "demo") -> DatasetConfig:
-    """Quick checks, an affordable demo, or the original LRAMB time protocol."""
+    """Quick checks, demo, finer observation, or the LRAMB time protocol."""
     if name == "quick":
         return DatasetConfig(n=8, burn_steps=16, production_steps=64,
                              sample_every=1, blocks=4, train_trajectories=2,
                              validation_trajectories=1, test_trajectories=2)
     if name == "demo":
         return DatasetConfig()
+    if name == "refined":
+        # Retain every Euler step to remove the demo's eight-step observation
+        # gap. Keep its physical parameters, grid and production duration.
+        return DatasetConfig(burn_steps=16_000, sample_every=1,
+                             train_trajectories=8, validation_trajectories=4,
+                             test_trajectories=4)
     if name == "reference":
         return DatasetConfig(n=64, burn_steps=40_000, production_steps=64_000,
                              sample_every=40, blocks=8)
-    raise ValueError("preset must be quick, demo or reference")
+    raise ValueError("preset must be quick, demo, refined or reference")
 
 
 def condition_id(ell: float) -> str:
