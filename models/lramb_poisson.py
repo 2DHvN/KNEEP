@@ -21,7 +21,8 @@ import numpy as np
 import torch
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+GENERATOR_REVISION = "canonical-fourier-v3-shards"
 CHANNEL_NAMES = ("local conservative", "kernel conservative", "local active")
 SPLITS = ("train", "validation", "test")
 _SEED_OFFSETS = {"train": 0, "validation": 100_000, "test": 200_000}
@@ -48,6 +49,7 @@ class DatasetConfig:
     D: float = 0.05
     mean: float = -0.2
     strength: float = 0.35
+    include_no_interaction: bool = False
     burn_steps: int = 4_000
     production_steps: int = 8_192
     sample_every: int = 8
@@ -88,6 +90,8 @@ class DatasetConfig:
             raise ValueError("dx, dt, b, mobility, D must be positive; kappa >= 0")
         if self.initial_mode not in {"stripe", "random"}:
             raise ValueError("initial_mode must be stripe or random")
+        if not isinstance(self.include_no_interaction, bool):
+            raise ValueError("include_no_interaction must be bool")
 
     @property
     def interval(self) -> float:
@@ -100,6 +104,10 @@ class DatasetConfig:
     @property
     def max_distance(self) -> int:
         return self.n // 2
+
+    @property
+    def train_pairs(self) -> int:
+        return self.train_trajectories * (self.production_steps // self.sample_every)
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -137,17 +145,46 @@ def dataset_preset(name: str = "demo") -> DatasetConfig:
         return DatasetConfig(burn_steps=16_000, sample_every=1,
                              train_trajectories=8, validation_trajectories=4,
                              test_trajectories=4)
+    if name == "production":
+        # 128 independent trajectories x 8192 adjacent frame pairs = 2**20
+        # training pairs per condition, including the single g=0 control.
+        return DatasetConfig(burn_steps=16_000, sample_every=1,
+                             train_trajectories=128, validation_trajectories=4,
+                             test_trajectories=4, include_no_interaction=True)
     if name == "reference":
         return DatasetConfig(n=64, burn_steps=40_000, production_steps=64_000,
                              sample_every=40, blocks=8)
-    raise ValueError("preset must be quick, demo, refined or reference")
+    raise ValueError("preset must be quick, demo, refined, production or reference")
 
 
 def condition_id(ell: float) -> str:
     value = float(ell)
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError("ell must be positive and finite")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("ell must be nonnegative and finite; zero denotes the g=0 control")
+    if value == 0:
+        return "no_interaction"
     return f"ell_{value:.12g}"
+
+
+def dataset_conditions(config: DatasetConfig) -> list[dict[str, Any]]:
+    """Physical range conditions and one optional independent g=0 control.
+
+    The control's ``ell=0`` is a manifest identifier only. The solver receives
+    the valid range ell=1 and strength=0, so it has no conservative LR force.
+    Its active term and local conservative free energy are unchanged.
+    """
+    result = [dict(ell=ell, solver_ell=ell, strength=config.strength,
+                   condition_id=condition_id(ell), is_control=False,
+                   label=f"Poisson ell={ell:g}, g={config.strength:g}")
+              for ell in config.ells]
+    if config.include_no_interaction:
+        result.append(dict(ell=0.0, solver_ell=1.0, strength=0.0,
+                           condition_id="no_interaction", is_control=True,
+                           label="No long-range interaction (g=0)"))
+    ids = [item["condition_id"] for item in result]
+    if len(set(ids)) != len(ids):
+        raise ValueError("ell values are too close to produce distinct condition names")
+    return result
 
 
 def read_manifest(output_dir: str | Path) -> dict[str, Any]:
@@ -159,21 +196,96 @@ def load_config(output_dir: str | Path) -> DatasetConfig:
     return DatasetConfig.from_dict(read_manifest(output_dir)["config"])
 
 
-def load_dataset(output_dir: str | Path, ell: float, split: str = "test") -> dict[str, Any]:
-    """Load only CPU tensors and JSON-like metadata; no LRAMB import is needed."""
+def _split_record(output_dir: str | Path, ell: float, split: str):
     if split == "val":
         split = "validation"
     if split not in SPLITS:
         raise ValueError(f"split must be one of {SPLITS}")
-    manifest = read_manifest(output_dir)
+    directory = Path(output_dir)
+    manifest = read_manifest(directory)
     matching = [c for c in manifest["conditions"] if float(c["ell"]) == float(ell)]
     if not matching:
         raise ValueError(f"ell={ell} is absent from dataset.json")
-    payload = torch.load(Path(output_dir) / matching[0]["files"][split],
-                         map_location="cpu", weights_only=True)
-    if payload["metadata"]["signature"] != manifest["signature"]:
+    path = directory / matching[0]["files"][split]
+    if path.suffix != ".json":
+        return manifest, matching[0], path, None
+    if not path.is_file():
+        raise FileNotFoundError(f"Split is not finalized yet: {path}")
+    with path.open(encoding="utf-8") as stream:
+        index = json.load(stream)
+    if index.get("signature") != manifest["signature"]:
         raise ValueError("saved split does not match dataset.json; regenerate the dataset")
-    return payload
+    return manifest, matching[0], path, index
+
+
+def open_video_dataset(output_dir: str | Path, ell: float, split: str = "train",
+                       cache_size: int = 128):
+    """Open a trajectory-sharded movie without concatenating training fields.
+
+    The adapter maps at most ``cache_size`` shard files and retrieves adjacent
+    pairs on demand. Loading saved data does not import the LRAMB solver.
+    """
+    from utils.video_data import ShardedVideo
+
+    manifest, _, path, index = _split_record(output_dir, ell, split)
+    if index is None:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if payload["metadata"]["signature"] != manifest["signature"]:
+            raise ValueError("saved split does not match dataset.json; regenerate the dataset")
+        return payload["video"]
+    paths = [Path(output_dir) / shard["file"] for shard in index["shards"]]
+    return ShardedVideo(paths, max_cached_shards=cache_size,
+                        shape=tuple(index["video_shape"]))
+
+
+def load_dataset(output_dir: str | Path, ell: float, split: str = "test", *,
+                 lazy: bool | None = None, cache_size: int = 128) -> dict[str, Any]:
+    """Load references and CPU fields, mapping large train movies on demand.
+
+    Schema-1 dense files remain supported. For schema-2 shards, train defaults
+    to ``ShardedVideo`` and validation/test default to dense tensors. Explicit
+    ``lazy=False`` concatenates any split; avoid it for million-pair training.
+    """
+    manifest, _, path, index = _split_record(output_dir, ell, split)
+    if index is None:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if payload["metadata"]["signature"] != manifest["signature"]:
+            raise ValueError("saved split does not match dataset.json; regenerate the dataset")
+        return payload
+    if lazy is None:
+        lazy = split == "train"
+    tensor_names = ["reference_increment", "reference_branch_increment", "reference_map"]
+    if not lazy:
+        tensor_names.append("video")
+    tensors = {name: [] for name in tensor_names}
+    diagnostics: dict[str, list] = {name: [] for name in
+        ("mass", "variance", "energy", "quartic_balance_error", "fourier_state_error")}
+    initial_hashes = []
+    common = {}
+    for shard in index["shards"]:
+        payload = torch.load(Path(output_dir) / shard["file"], map_location="cpu",
+                             weights_only=True, mmap=True)
+        if payload.get("metadata", {}).get("signature") != manifest["signature"]:
+            raise ValueError(f"Shard signature mismatch: {shard['file']}")
+        for name in tensor_names:
+            tensors[name].append(payload[name])
+        for name in diagnostics:
+            diagnostics[name].append(payload["diagnostics"][name])
+        initial_hashes.extend(payload["diagnostics"]["initial_hashes"])
+        if not common:
+            common = {name: payload[name] for name in
+                      ("kernel_weights", "kernel_multiplier", "time")}
+    result = {name: torch.cat(values, dim=0) for name, values in tensors.items()}
+    result.update(common)
+    result["diagnostics"] = {name: torch.cat(values, dim=0)
+                             for name, values in diagnostics.items()}
+    result["diagnostics"]["initial_hashes"] = initial_hashes
+    result["metadata"] = index["metadata"]
+    if lazy:
+        result["video"] = open_video_dataset(output_dir, ell, split, cache_size)
+    if result["metadata"]["signature"] != manifest["signature"]:
+        raise ValueError("saved split does not match dataset.json; regenerate the dataset")
+    return result
 
 
 def _atomic_json(value: dict[str, Any], path: Path) -> None:
@@ -248,8 +360,20 @@ def _run_numpy(model, cfg: DatasetConfig, multipliers: np.ndarray) -> dict[str, 
     phi = model.initial_field(cfg.initial_mode)
     initial_hash = _hash_array(phi)
     ph = np.fft.fft2(phi, norm="ortho")
+    max_fourier_state_error = 0.0
+
+    def advance():
+        nonlocal max_fourier_state_error
+        new, propagated = model.step(phi, ph)
+        # The real field is authoritative. Do not carry a spectrum that an
+        # external solver's inverse FFT may have projected differently.
+        canonical = np.fft.fft2(new, norm="ortho")
+        max_fourier_state_error = max(
+            max_fourier_state_error, float(np.max(np.abs(propagated - canonical))))
+        return new, canonical
+
     for step in range(cfg.burn_steps):
-        phi, ph = model.step(phi, ph)
+        phi, ph = advance()
         if step % 100 == 0 and (not np.isfinite(phi).all() or np.max(np.abs(phi)) > 30):
             raise FloatingPointError("Unstable burn-in trajectory; reduce dt")
     count = cfg.production_steps // cfg.sample_every
@@ -271,7 +395,7 @@ def _run_numpy(model, cfg: DatasetConfig, multipliers: np.ndarray) -> dict[str, 
 
     previous_shell_energy = record(0)
     for step in range(1, cfg.production_steps + 1):
-        new, new_hat = model.step(phi, ph)
+        new, new_hat = advance()
         ds = model.entropy_maps(phi, new, ph, new_hat)
         ep_maps += ds
         interval += model.dV * ds.sum(axis=(1, 2))
@@ -293,7 +417,8 @@ def _run_numpy(model, cfg: DatasetConfig, multipliers: np.ndarray) -> dict[str, 
     return dict(video=video, reference_increment=reference,
                 reference_branch_increment=branches, reference_map=ep_maps / cfg.duration,
                 mass=mass, variance=variance, energy=energies,
-                initial_hash=initial_hash, quartic_balance_error=max_balance_error)
+                initial_hash=initial_hash, quartic_balance_error=max_balance_error,
+                fourier_state_error=max_fourier_state_error)
 
 
 def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str) -> dict[str, Any]:
@@ -324,11 +449,19 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str) 
     ep_maps = torch.zeros((3, cfg.n, cfg.n), **kw)
     interval = torch.zeros(3, **kw)
     max_balance_error = torch.zeros((), **kw)
+    max_fourier_state_error = torch.zeros((), **kw)
 
     def advance():
+        nonlocal max_fourier_state_error
         normal = torch.randn(phi.shape, generator=rng, **kw)
-        return _step(phi, ph, normal, linear, q2, noise_scale,
-                     cfg.dt * cfg.mobility, cfg.b, cfg.lam, cfg.dx)
+        new, propagated = _step(phi, ph, normal, linear, q2, noise_scale,
+                                cfg.dt * cfg.mobility, cfg.b, cfg.lam, cfg.dx)
+        # This generator enforces field/spectrum consistency independently of
+        # the imported LRAMB version and the FFT backend's inverse projection.
+        canonical = torch.fft.rfft2(new, norm="ortho")
+        max_fourier_state_error = torch.maximum(
+            max_fourier_state_error, (propagated - canonical).abs().max())
+        return new, canonical
 
     def record(index):
         video[index, 0] = phi.float().cpu()
@@ -370,118 +503,262 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str) 
     return dict(video=video, reference_increment=reference.cpu(),
                 reference_branch_increment=branches.cpu(), reference_map=(ep_maps / cfg.duration).cpu(),
                 mass=mass.cpu(), variance=variance.cpu(), energy=energies.cpu(),
-                initial_hash=initial_hash, quartic_balance_error=float(max_balance_error.cpu()))
+                initial_hash=initial_hash, quartic_balance_error=float(max_balance_error.cpu()),
+                fourier_state_error=float(max_fourier_state_error.cpu()))
+
+
+def _check_trajectory_reference(trajectory, *, ell, split, seed, backend):
+    """Check one trajectory before generating the rest of an expensive split."""
+    channels = torch.as_tensor(trajectory["reference_increment"])
+    branches = torch.as_tensor(trajectory["reference_branch_increment"])
+    # Remove the local terms that are assigned to radius zero. This exposes
+    # the kernel channel alone instead of masking it with large local EP.
+    kernel_shells = branches.clone()
+    kernel_shells[:, 0] -= channels[:, 0] + channels[:, 2]
+    try:
+        torch.testing.assert_close(kernel_shells.sum(-1), channels[:, 1],
+                                   atol=1e-8, rtol=1e-9)
+    except AssertionError as error:
+        mismatch = (kernel_shells.sum(-1) - channels[:, 1]).abs()
+        index = int(mismatch.argmax())
+        raise RuntimeError(
+            f"{GENERATOR_REVISION}: kernel EP inconsistency; ell={ell:g}, "
+            f"split={split}, seed={seed}, backend={backend}, interval={index}. "
+            f"shell={float(kernel_shells[index].sum()):.17g}, "
+            f"midpoint={float(channels[index, 1]):.17g}, "
+            f"max_abs_error={float(mismatch.max()):.6g}, "
+            f"max_propagated_spectrum_error={trajectory['fourier_state_error']:.6g}. "
+            f"torch={torch.__version__}, generator={Path(__file__).resolve()}. "
+            "This check compares the kernel alone, before stacking trajectories."
+        ) from error
+
+
+def _generation_source(root: Path) -> dict[str, str]:
+    return dict(lramb_root=str(root),
+                lramb_model_sha256=sha256((root / "lramb/model.py").read_bytes()).hexdigest(),
+                lramb_torch_backend_sha256=sha256((root / "lramb/torch_backend.py").read_bytes()).hexdigest(),
+                generator_sha256=sha256(Path(__file__).read_bytes()).hexdigest())
+
+
+def prepare_generation(config: DatasetConfig, output_dir: str | Path,
+                       lramb_root: str | Path | None = None, device: str = "cpu",
+                       force: bool = False) -> dict[str, Any]:
+    """Prepare a manifest once, before independent worker processes are started.
+
+    Returned ``trajectory_tasks`` are JSON-serializable. Each task writes only
+    its own atomic trajectory shard; workers never update shared manifest JSON.
+    CUDA device indices do not enter the dataset signature, allowing the same
+    prepared tasks to be distributed over cuda:0, cuda:1, and so on.
+    """
+    if not isinstance(config, DatasetConfig):
+        raise TypeError("config must be a DatasetConfig")
+    root, _ = _lramb_module(lramb_root)
+    backend = _backend(device)
+    backend["device"] = torch.device(backend["device"]).type
+    source = _generation_source(root)
+    signature_input = dict(schema_version=SCHEMA_VERSION, config=config.to_dict(),
+                           source={k: v for k, v in source.items() if k != "lramb_root"},
+                           backend=backend)
+    signature = sha256(json.dumps(signature_input, sort_keys=True).encode()).hexdigest()
+    directory = Path(output_dir).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    old = read_manifest(directory) if (directory / "dataset.json").exists() else None
+    if old and old.get("signature") != signature and not force:
+        raise ValueError("Dataset configuration, solver source or backend changed. "
+                         "Use a new output directory or force=True.")
+    frames = config.production_steps // config.sample_every + 1
+    manifest = dict(schema_version=SCHEMA_VERSION, generator_revision=GENERATOR_REVISION,
+        storage="trajectory_shards", signature=signature, config=config.to_dict(),
+        source=source, backend=backend, complete=False,
+        splits={split: dict(trajectories=len(config.seeds(split)), seeds=list(config.seeds(split)),
+                            adjacent_pairs=len(config.seeds(split)) * (frames - 1))
+                for split in SPLITS},
+        train_pairs_per_condition=config.train_pairs,
+        train_video_bytes_per_condition=config.train_trajectories * frames * config.n ** 2 * 4,
+        conditions=[], trajectory_tasks=[])
+    for condition in dataset_conditions(config):
+        cid = condition["condition_id"]
+        entry = dict(condition, files={split: f"data/{cid}/{split}.json" for split in SPLITS},
+                     shards={split: [] for split in SPLITS})
+        for split in SPLITS:
+            for index, seed in enumerate(config.seeds(split)):
+                file = f"data/{cid}/{split}/trajectory_{index:05d}_seed_{seed}.pt"
+                shard = dict(file=file, trajectory_index=index, seed=seed,
+                             frames=frames, pairs=frames - 1)
+                entry["shards"][split].append(shard)
+                manifest["trajectory_tasks"].append(dict(shard, output_dir=str(directory),
+                    signature=signature, condition_id=cid, ell=condition["ell"],
+                    split=split, force=bool(force)))
+        manifest["conditions"].append(entry)
+    _atomic_json(manifest, directory / "dataset.json")
+    return manifest
+
+
+def _trajectory_metadata(manifest, condition, split, seeds, multiplier_hash, backend):
+    config = DatasetConfig.from_dict(manifest["config"])
+    return dict(schema_version=SCHEMA_VERSION, signature=manifest["signature"],
+        generator_revision=GENERATOR_REVISION, source=manifest["source"],
+        config=config.to_dict(), ell=condition["ell"], solver_ell=condition["solver_ell"],
+        strength=condition["strength"], is_control=condition["is_control"],
+        condition_id=condition["condition_id"], label=condition["label"],
+        split=split, seeds=list(seeds), backend=backend, dt=config.dt,
+        interval=config.interval, duration=config.duration, dV=config.dx ** 2,
+        area=(config.n * config.dx) ** 2, channel_names=list(CHANNEL_NAMES),
+        branch_distance="periodic Chebyshev lattice distance; local conservative + active in radius 0",
+        reference_increment_units="spatially integrated medium entropy per saved interval",
+        reference_map_units="medium EP density per physical time; spatial integral multiplies by dx**2",
+        entropy_convention="Euler-Maruyama drift; midpoint chemical potentials at every solver step",
+        interpretation="medium entropy excludes stochastic system entropy; learned branch maps need not match this gauge",
+        kernel_multiplier_sha256=multiplier_hash)
+
+
+def generate_trajectory_task(task: dict[str, Any], *, device: str = "cpu",
+                             progress: bool = True) -> dict[str, Any]:
+    """Generate or reuse one prepared trajectory; safe for separate processes.
+
+    Give every concurrent worker a distinct prepared task. The scheduler owns
+    preparation/finalization, and must not schedule the same task twice.
+    """
+    directory = Path(task["output_dir"])
+    manifest = read_manifest(directory)
+    if manifest["signature"] != task["signature"]:
+        raise ValueError("Prepared task signature no longer matches dataset.json")
+    condition = next((item for item in manifest["conditions"]
+                      if item["condition_id"] == task["condition_id"]), None)
+    if condition is None or task["split"] not in SPLITS:
+        raise ValueError("Task condition/split is absent from the prepared manifest")
+    split = task["split"]
+    expected = condition["shards"][split][task["trajectory_index"]]
+    if any(task[key] != expected[key] for key in ("file", "seed", "trajectory_index")):
+        raise ValueError("Task trajectory does not match the prepared manifest")
+    backend = _backend(device)
+    identity = dict(backend, device=torch.device(backend["device"]).type)
+    if identity != manifest["backend"]:
+        raise ValueError("Worker backend differs from the prepared dataset backend")
+    path = directory / task["file"]
+    if path.is_file() and not task.get("force", False):
+        cached = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        metadata = cached.get("metadata", {})
+        if (metadata.get("signature") != manifest["signature"]
+                or metadata.get("condition_id") != condition["condition_id"]
+                or metadata.get("seeds") != [task["seed"]]):
+            raise ValueError(f"Cached {path} has mismatching metadata; use force=True or a new directory")
+        if progress:
+            print(f"{condition['condition_id']}, {split} seed={task['seed']}: using matching shard", flush=True)
+        return dict(file=task["file"], condition_id=condition["condition_id"], split=split,
+                    seed=task["seed"], cached=True)
+    config = DatasetConfig.from_dict(manifest["config"])
+    root, lramb = _lramb_module(manifest["source"]["lramb_root"])
+    if _generation_source(root) != manifest["source"]:
+        raise ValueError("Solver/generator source changed after preparation; prepare again")
+    effective = replace(config, strength=condition["strength"])
+    parameters = lramb.Parameters(**{key: getattr(effective, key) for key in
+        ("n", "dx", "dt", "a", "b", "kappa", "lam", "mobility", "D", "mean")},
+        seed=task["seed"])
+    kernel = lramb.KernelSpec("poisson", strength=condition["strength"], ell=condition["solver_ell"])
+    model = lramb.ActiveModelB(parameters, kernel,
+        multiplier=np.zeros((config.n, config.n)) if condition["is_control"] else None)
+    multipliers = _shell_multipliers(model)
+    if progress:
+        print(f"{GENERATOR_REVISION}: {condition['condition_id']}, {split} "
+              f"seed={task['seed']}, {config.burn_steps + config.production_steps:,} steps "
+              f"({backend['name']}/{backend['device']})", flush=True)
+    trajectory = (_run_numpy(model, effective, multipliers) if backend["name"] == "numpy"
+                  else _run_torch(model, effective, multipliers, backend["device"]))
+    _check_trajectory_reference(trajectory, ell=condition["ell"], split=split,
+                                seed=task["seed"], backend=backend)
+    payload = {name: torch.as_tensor(trajectory[name]).unsqueeze(0).cpu() for name in
+               ("video", "reference_increment", "reference_branch_increment", "reference_map")}
+    payload.update(kernel_weights=torch.as_tensor(model.weights.copy(), dtype=torch.float64),
+        kernel_multiplier=torch.as_tensor(model.K.copy(), dtype=torch.float64),
+        time=torch.arange(config.production_steps // config.sample_every + 1,
+                          dtype=torch.float64) * config.interval,
+        diagnostics={name: torch.as_tensor(trajectory[name]).unsqueeze(0).cpu()
+                     for name in ("mass", "variance", "energy")})
+    payload["diagnostics"].update(initial_hashes=[trajectory["initial_hash"]],
+        quartic_balance_error=torch.tensor([trajectory["quartic_balance_error"]], dtype=torch.float64),
+        fourier_state_error=torch.tensor([trajectory["fourier_state_error"]], dtype=torch.float64))
+    payload["metadata"] = _trajectory_metadata(manifest, condition, split, [task["seed"]],
+                                               _hash_array(model.K), backend)
+    # Runtime scientific identities are retained, with their original tolerances.
+    torch.testing.assert_close(payload["reference_branch_increment"].sum(-1),
+                               payload["reference_increment"].sum(-1), atol=1e-8, rtol=1e-9)
+    torch.testing.assert_close(payload["reference_map"].sum((-2, -1)) * config.dx ** 2,
+                               payload["reference_increment"].sum(1) / config.duration,
+                               atol=1e-9, rtol=1e-9)
+    _atomic_torch(payload, path)
+    return dict(file=task["file"], condition_id=condition["condition_id"], split=split,
+                seed=task["seed"], cached=False)
+
+
+def finalize_generation(output_dir: str | Path) -> dict[str, Any]:
+    """Parent-only completion: validate every shard and write split indexes."""
+    directory = Path(output_dir)
+    manifest = read_manifest(directory)
+    config = DatasetConfig.from_dict(manifest["config"])
+    frames = config.production_steps // config.sample_every + 1
+    for condition in manifest["conditions"]:
+        for split in SPLITS:
+            initial_hashes = []
+            multiplier_hash = None
+            shards = condition["shards"][split]
+            for shard in shards:
+                path = directory / shard["file"]
+                if not path.is_file():
+                    raise FileNotFoundError(f"Missing trajectory shard: {path}")
+                payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+                metadata = payload.get("metadata", {})
+                if (metadata.get("signature") != manifest["signature"]
+                        or metadata.get("condition_id") != condition["condition_id"]
+                        or metadata.get("split") != split or metadata.get("seeds") != [shard["seed"]]):
+                    raise ValueError(f"Trajectory shard has mismatching metadata: {path}")
+                if tuple(payload["video"].shape) != (1, frames, 1, config.n, config.n):
+                    raise ValueError(f"Trajectory shard has the wrong movie shape: {path}")
+                current_hash = metadata["kernel_multiplier_sha256"]
+                if multiplier_hash is not None and current_hash != multiplier_hash:
+                    raise ValueError(f"Kernel hash differs within a split: {path}")
+                multiplier_hash = current_hash
+                initial_hashes.extend(payload["diagnostics"]["initial_hashes"])
+            condition["kernel_multiplier_sha256"] = multiplier_hash
+            condition.setdefault("initial_hashes", {})[split] = initial_hashes
+            index = dict(schema_version=SCHEMA_VERSION, signature=manifest["signature"],
+                storage="trajectory_shards", complete=True, shards=shards,
+                video_shape=[len(shards), frames, 1, config.n, config.n],
+                adjacent_pairs=len(shards) * (frames - 1),
+                metadata=_trajectory_metadata(manifest, condition, split, config.seeds(split),
+                                               multiplier_hash, manifest["backend"]))
+            _atomic_json(index, directory / condition["files"][split])
+    # Same seed gives the same initial field across ranges, including g=0.
+    for split in SPLITS:
+        expected_hashes = manifest["conditions"][0]["initial_hashes"][split]
+        if any(item["initial_hashes"][split] != expected_hashes for item in manifest["conditions"]):
+            raise ValueError(f"Initial fields differ across conditions for split={split}")
+    manifest["complete"] = True
+    _atomic_json(manifest, directory / "dataset.json")
+    return manifest
 
 
 def generate_datasets(config: DatasetConfig, output_dir: str | Path,
                       lramb_root: str | Path | None = None, device: str = "cpu",
                       progress: bool = True, force: bool = False) -> dict[str, Any]:
-    """Integrate independent split trajectories and atomically cache their data.
+    """Serial convenience wrapper around the parallel-safe trajectory task API.
 
-    Existing data are reused only when config, solver/generator source and
-    backend signatures match. Mismatches require ``force=True`` or a new folder.
-    CPU uses LRAMB's NumPy solver; CUDA uses its actual Torch solver kernels.
+    A single shard is resident while simulating. Matching shards resume after
+    interruption; no 128-trajectory train movie is concatenated in memory.
+    The script scheduler can distribute ``trajectory_tasks`` among GPUs and
+    call ``finalize_generation`` once all workers have finished.
     """
-    if not isinstance(config, DatasetConfig):
-        raise TypeError("config must be a DatasetConfig")
-    root, lramb = _lramb_module(lramb_root)
-    backend = _backend(device)
-    source = {"lramb_root": str(root),
-              "lramb_model_sha256": sha256((root / "lramb/model.py").read_bytes()).hexdigest(),
-              "lramb_torch_backend_sha256": sha256((root / "lramb/torch_backend.py").read_bytes()).hexdigest(),
-              "generator_sha256": sha256(Path(__file__).read_bytes()).hexdigest()}
-    # The root path is provenance, not a physical or numerical input.
-    signature_input = dict(schema_version=SCHEMA_VERSION, config=config.to_dict(),
-                           source={k: v for k, v in source.items() if k != "lramb_root"}, backend=backend)
-    signature = sha256(json.dumps(signature_input, sort_keys=True).encode()).hexdigest()
-    output_dir = Path(output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    old = read_manifest(output_dir) if (output_dir / "dataset.json").exists() else None
-    if old and old.get("signature") != signature and not force:
-        raise ValueError("Dataset configuration, solver source or backend changed. Use a new output directory or force=True.")
-    ids = [condition_id(ell) for ell in config.ells]
-    if len(ids) != len(set(ids)):
-        raise ValueError("ell values are too close to produce distinct condition names")
-    manifest = dict(schema_version=SCHEMA_VERSION, signature=signature,
-                    config=config.to_dict(), source=source, backend=backend,
-                    splits={split: {"trajectories": len(config.seeds(split)),
-                                    "seeds": list(config.seeds(split))} for split in SPLITS},
-                    conditions=[], complete=False)
-    for ell in config.ells:
-        manifest["conditions"].append(dict(ell=ell, condition_id=condition_id(ell),
-            files={split: f"data/{condition_id(ell)}/{split}.pt" for split in SPLITS}))
-    _atomic_json(manifest, output_dir / "dataset.json")
-
-    for condition in manifest["conditions"]:
-        ell = condition["ell"]
-        for split in SPLITS:
-            path = output_dir / condition["files"][split]
-            if path.exists() and not force:
-                cached = torch.load(path, map_location="cpu", weights_only=True)
-                if cached.get("metadata", {}).get("signature") != signature:
-                    raise ValueError(f"Cached {path} has a mismatching signature; use force=True or a new directory")
-                if progress:
-                    print(f"ell={ell:g}, {split}: using matching dataset", flush=True)
-                condition["kernel_multiplier_sha256"] = cached["metadata"]["kernel_multiplier_sha256"]
-                condition.setdefault("initial_hashes", {})[split] = cached["diagnostics"]["initial_hashes"]
-                continue
-            trajectories = []
-            model = None
-            for index, seed in enumerate(config.seeds(split)):
-                parameters = lramb.Parameters(**{k: getattr(config, k) for k in
-                    ("n", "dx", "dt", "a", "b", "kappa", "lam", "mobility", "D", "mean")}, seed=seed)
-                model = lramb.ActiveModelB(parameters, lramb.KernelSpec("poisson", strength=config.strength, ell=ell))
-                multipliers = _shell_multipliers(model)
-                if progress:
-                    print(f"ell={ell:g}, {split} {index + 1}/{len(config.seeds(split))}: "
-                          f"{config.burn_steps + config.production_steps:,} steps ({backend['name']}/{backend['device']})", flush=True)
-                runner = (_run_numpy(model, config, multipliers) if backend["name"] == "numpy"
-                          else _run_torch(model, config, multipliers, backend["device"]))
-                trajectories.append(runner)
-            def stacked(name):
-                return torch.stack([torch.as_tensor(item[name]) for item in trajectories]).cpu()
-            multiplier_hash = _hash_array(model.K)
-            initial_hashes = [item["initial_hash"] for item in trajectories]
-            payload = {name: stacked(name) for name in
-                       ("video", "reference_increment", "reference_branch_increment", "reference_map")}
-            payload.update(kernel_weights=torch.as_tensor(model.weights.copy(), dtype=torch.float64),
-                           kernel_multiplier=torch.as_tensor(model.K.copy(), dtype=torch.float64),
-                           time=torch.arange(config.production_steps // config.sample_every + 1,
-                                             dtype=torch.float64) * config.interval,
-                           diagnostics={name: stacked(name) for name in ("mass", "variance", "energy")})
-            payload["diagnostics"].update(initial_hashes=initial_hashes,
-                quartic_balance_error=torch.tensor([item["quartic_balance_error"] for item in trajectories], dtype=torch.float64))
-            payload["metadata"] = dict(schema_version=SCHEMA_VERSION, signature=signature,
-                source=source, config=config.to_dict(), ell=ell, split=split,
-                seeds=list(config.seeds(split)), backend=backend, dt=config.dt,
-                interval=config.interval, duration=config.duration, dV=config.dx ** 2,
-                area=(config.n * config.dx) ** 2, channel_names=list(CHANNEL_NAMES),
-                branch_distance="periodic Chebyshev lattice distance; local conservative + active in radius 0",
-                reference_increment_units="spatially integrated medium entropy per saved interval",
-                reference_map_units="medium EP density per physical time; spatial integral multiplies by dx**2",
-                entropy_convention="Euler-Maruyama drift; midpoint chemical potentials at every solver step",
-                interpretation="medium entropy excludes stochastic system entropy; learned branch maps need not match this gauge",
-                kernel_multiplier_sha256=multiplier_hash)
-            # The quadratic shell identity must reconstruct the full reference.
-            torch.testing.assert_close(payload["reference_branch_increment"].sum(-1),
-                                       payload["reference_increment"].sum(-1), atol=1e-8, rtol=1e-9,
-                                       msg=lambda detail: (
-                                           "Kernel-shell EP does not reconstruct midpoint medium EP. "
-                                           "Update LRAMB/lramb/model.py and torch_backend.py to the "
-                                           "Hermitian-projected Euler step and regenerate in a new "
-                                           "output directory. Increasing the tolerance would conceal "
-                                           "a Fourier/real-field energy inconsistency.\n" + detail))
-            torch.testing.assert_close(payload["reference_map"].sum((-2, -1)) * config.dx ** 2,
-                                       payload["reference_increment"].sum(1) / config.duration,
-                                       atol=1e-9, rtol=1e-9)
-            _atomic_torch(payload, path)
-            condition["kernel_multiplier_sha256"] = multiplier_hash
-            condition.setdefault("initial_hashes", {})[split] = initial_hashes
-            _atomic_json(manifest, output_dir / "dataset.json")
-    manifest["complete"] = True
-    _atomic_json(manifest, output_dir / "dataset.json")
-    return manifest
+    manifest = prepare_generation(config, output_dir, lramb_root, device, force)
+    if progress:
+        print(f"generator={GENERATOR_REVISION}; module={Path(__file__).resolve()}; "
+              f"LRAMB={manifest['source']['lramb_root']}; backend={manifest['backend']}; "
+              f"train pairs/condition={config.train_pairs:,}; torch={torch.__version__}", flush=True)
+    for task in manifest["trajectory_tasks"]:
+        generate_trajectory_task(task, device=device, progress=progress)
+    return finalize_generation(output_dir)
 
 
-__all__ = ["DatasetConfig", "dataset_preset", "condition_id", "generate_datasets",
-           "load_dataset", "load_config", "read_manifest", "CHANNEL_NAMES", "SPLITS"]
+__all__ = ["DatasetConfig", "dataset_preset", "condition_id", "dataset_conditions",
+           "generate_datasets", "prepare_generation", "generate_trajectory_task",
+           "finalize_generation", "open_video_dataset", "load_dataset", "load_config",
+           "read_manifest", "CHANNEL_NAMES", "SPLITS"]

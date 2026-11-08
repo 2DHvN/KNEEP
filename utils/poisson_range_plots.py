@@ -20,7 +20,21 @@ Records = Sequence[Mapping[str, Any]]
 _LEARNED = "#2466a0"
 _REFERENCE = "#c46c28"
 _TRAJECTORY = "#8997a6"
-_COMPONENTS = ("local conservative", "Poisson conservative", "active")
+_COMPONENTS = ("local conservative", "long-range conservative", "active")
+
+
+def condition_label(record: Mapping[str, Any]) -> str:
+    """Distinguish the g=0 control from a physical zero-range kernel."""
+    if record.get("is_control") or float(record["ell"]) == 0:
+        return "g=0 (no long-range)"
+    return rf"$\ell={float(record['ell']):g}$"
+
+
+def _condition_axis(ax: Any, records: Records) -> None:
+    """Use condition ticks so the control is never fitted as a range value."""
+    ax.set_xticks(np.arange(len(records)))
+    ax.set_xticklabels([condition_label(record) for record in records], fontsize=8)
+    ax.set_xlabel("long-range interaction condition")
 
 
 def _array(value: Any) -> np.ndarray:
@@ -85,7 +99,7 @@ def plot_cumulative_ep(records: Records) -> Figure:
         for component, label in enumerate(_COMPONENTS):
             component_ax.plot(time, ref_cumulative[..., component].mean(0), label=label)
         component_ax.plot(time, ref_total, color="black", linewidth=1.2, linestyle="--", label="medium total")
-        ax.set_title(rf"$\ell={float(record['ell']):g}$: cumulative total")
+        ax.set_title(f"{condition_label(record)}: cumulative total")
         component_ax.set_title("Reference components; conservative terms are boundaries")
         for panel in (ax, component_ax):
             panel.set(xlabel="elapsed time within each trajectory", ylabel="cumulative EP")
@@ -132,7 +146,7 @@ def plot_time_averaged_ep(records: Records, trajectory: int = 0) -> Figure:
             axes[row, 3].imshow(seed_spread, origin="lower", cmap="magma", vmin=0, vmax=spread_limit, extent=extent),
         )
         titles = (
-            rf"$\ell={float(record['ell']):g}$: final $\phi$",
+            f"{condition_label(record)}: final $\\phi$",
             f"KNEEP seed mean; sum={learned.sum():.3g}",
             f"Medium reference; sum={medium.sum():.3g}",
             "KNEEP fit-seed SD",
@@ -168,7 +182,7 @@ def plot_ep_spectrum(records: Records) -> Figure:
         ax.errorbar(radius, mean, yerr=_std(trajectory_means), fmt="o", color=_TRAJECTORY, alpha=0.8, capsize=5, label="independent trajectory SD")
         ax.errorbar(radius, mean, yerr=_std(seed_means), fmt="o-", color=_LEARNED, capsize=2, label="KNEEP mean +/- fit-seed SD")
         ax.plot(ref_radius, reference_mean, ".--", color=_REFERENCE, label="physical reference shells")
-        ax.set_title(rf"$\ell={float(record['ell']):g}$: signed mean shell rate")
+        ax.set_title(f"{condition_label(record)}: signed mean shell rate")
         ax.set_ylabel("EP / time")
         variance = np.var(rate, axis=2).mean(1)
         reference_variance = np.var(reference, axis=1).mean(0)
@@ -224,7 +238,7 @@ def plot_temporal_spectrum(records: Records) -> Figure:
         mean_psd = psd.mean((0, 1))
         seed_psd_spread = _std(psd.mean(1))
         ell = float(record["ell"])
-        axes[0].plot(frequency[1:], mean_psd[1:], color=color, label=rf"$\ell={ell:g}$ KNEEP")
+        axes[0].plot(frequency[1:], mean_psd[1:], color=color, label=f"{condition_label(record)} KNEEP")
         axes[0].fill_between(frequency[1:], np.maximum(mean_psd[1:] - seed_psd_spread[1:], 1e-30), mean_psd[1:] + seed_psd_spread[1:], color=color, alpha=0.13)
         axes[0].plot(frequency[1:], reference_psd.mean(0)[1:], color=color, linestyle="--", alpha=0.8)
         variance = np.var(total_rate, axis=-1)
@@ -236,10 +250,12 @@ def plot_temporal_spectrum(records: Records) -> Figure:
     axes[0].set(xlabel="frequency (1 / time)", ylabel="PSD of global EP rate", xscale="log", yscale="log", title="Per-trajectory periodograms; no boundary concatenation")
     axes[0].legend(fontsize=8)
     axes[0].text(0.02, 0.02, "solid: KNEEP; dashed: medium reference\nband: fit-seed SD; DC removed", transform=axes[0].transAxes, fontsize=8)
-    axes[1].errorbar(ells, learned_variances, yerr=learned_trajectory_sd, fmt="o", color=_TRAJECTORY, capsize=5, label="independent trajectory SD")
-    axes[1].errorbar(ells, learned_variances, yerr=learned_seed_sd, fmt="o-", color=_LEARNED, capsize=2, label="KNEEP mean +/- fit-seed SD")
-    axes[1].plot(ells, reference_variances, "s--", color=_REFERENCE, label="medium reference")
-    axes[1].set(xlabel=r"Poisson interaction length $\ell$", ylabel="mean within-trajectory Var(global EP / time)", title="Global temporal variation; branch covariances included")
+    positions = np.arange(len(records))
+    axes[1].errorbar(positions, learned_variances, yerr=learned_trajectory_sd, fmt="o", color=_TRAJECTORY, capsize=5, label="independent trajectory SD")
+    axes[1].errorbar(positions, learned_variances, yerr=learned_seed_sd, fmt="o", color=_LEARNED, capsize=2, label="KNEEP mean +/- fit-seed SD")
+    axes[1].plot(positions, reference_variances, "s", color=_REFERENCE, label="medium reference")
+    axes[1].set(ylabel="mean within-trajectory Var(global EP / time)", title="Global temporal variation; branch covariances included")
+    _condition_axis(axes[1], records)
     axes[1].legend(fontsize=8)
     for ax in axes:
         _style(ax, zero=False)
@@ -274,21 +290,28 @@ def plot_range_response(records: Records) -> Figure:
         # zero. Sum absolute *site* weights before grouping into shells.
         shells, absolute_mass = _kernel_shells(np.abs(_array(record["kernel_weights"])))
         total_mass = absolute_mass.sum()
-        tail = (total_mass - absolute_mass.cumsum()) / max(total_mass, 1e-30)
-        axes[1].plot(shells * float(record["dx"]), np.maximum(tail, 0), "o-", markersize=3, color=color, label=rf"$\ell={ell:g}$")
+        # A zero kernel has no normalized mass distribution. Do not draw a
+        # fabricated zero tail for the no-long-range control.
+        if total_mass > 0:
+            tail = (total_mass - absolute_mass.cumsum()) / total_mass
+            axes[1].plot(shells * float(record["dx"]), np.maximum(tail, 0), "o-", markersize=3, color=color, label=condition_label(record))
         signed_means = prediction.mean((1, 2)) / interval
         absolute_means = np.abs(signed_means)
         totals = absolute_means.sum(-1, keepdims=True)
         learned_tail = 1 - np.cumsum(absolute_means, axis=-1) / np.maximum(totals, 1e-30)
         learned_radius = np.arange(learned_tail.shape[-1]) * float(record["dx"])
-        axes[2].plot(learned_radius, learned_tail.mean(0), "o-", markersize=3, color=color, label=rf"$\ell={ell:g}$")
+        axes[2].plot(learned_radius, learned_tail.mean(0), "o-", markersize=3, color=color, label=condition_label(record))
         axes[2].fill_between(learned_radius, learned_tail.mean(0) - _std(learned_tail), learned_tail.mean(0) + _std(learned_tail), color=color, alpha=0.13)
-    axes[0].errorbar(ells, mean_rates, yerr=trajectory_sd, fmt="o", color=_TRAJECTORY, capsize=5, label="independent trajectory SD")
-    axes[0].errorbar(ells, mean_rates, yerr=seed_sd, fmt="o-", color=_LEARNED, capsize=2, label="KNEEP mean +/- fit-seed SD")
-    axes[0].plot(ells, medium_rates, "s--", color=_REFERENCE, label="medium reference")
-    axes[0].set(xlabel=r"Poisson interaction length $\ell$", ylabel="global mean EP / time", title="Does KNEEP respond to the range intervention?")
+    positions = np.arange(len(records))
+    axes[0].errorbar(positions, mean_rates, yerr=trajectory_sd, fmt="o", color=_TRAJECTORY, capsize=5, label="independent trajectory SD")
+    axes[0].errorbar(positions, mean_rates, yerr=seed_sd, fmt="o", color=_LEARNED, capsize=2, label="KNEEP mean +/- fit-seed SD")
+    axes[0].plot(positions, medium_rates, "s", color=_REFERENCE, label="medium reference")
+    axes[0].set(ylabel="global mean EP / time", title="Does KNEEP respond to the range intervention?")
+    _condition_axis(axes[0], records)
     axes[0].legend(fontsize=8)
     axes[1].set(xlabel="Chebyshev radius (physical length)", ylabel="fraction of sum |actual signed kernel weights| beyond radius", title="Actual Poisson kernel absolute-weight tail", ylim=(-0.04, 1.04))
+    if any(float(record["ell"]) == 0 for record in records):
+        axes[1].text(0.03, 0.03, "g=0: zero kernel, normalized tail undefined", transform=axes[1].transAxes, fontsize=8)
     axes[2].set(xlabel="learned branch radius (physical length)", ylabel="absolute signed-mean contribution fraction beyond radius", title="Learned shell response; band = fit-seed SD", ylim=(-0.04, 1.04))
     for ax in axes:
         _style(ax)
@@ -310,7 +333,7 @@ def plot_training_history(records: Records) -> Figure:
             color = f"C{repeat % 10}"
             ax.plot(iterations, _array(history["train_losses"]), color=color, alpha=0.35, linewidth=0.8)
             ax.plot(iterations, _array(history["validation_losses"]), color=color, label=f"fit seed {repeat}: validation")
-        ax.set(title=rf"$\ell={float(record['ell']):g}$; faint = sampled training loss", xlabel="optimizer iteration", ylabel="alpha-divergence objective")
+        ax.set(title=f"{condition_label(record)}; faint = sampled training loss", xlabel="optimizer iteration", ylabel="alpha-divergence objective")
         _style(ax)
         if record.get("history"):
             ax.legend(fontsize=8)
@@ -332,9 +355,9 @@ def plot_kernel_diagnostics(records: Records) -> Figure:
         dx, ell = float(record["dx"]), float(record["ell"])
         n = weights.shape[-1]
         half = n * dx / 2
-        limit = max(float(np.max(np.abs(weights))), 1e-30)
+        limit = float(np.max(np.abs(weights))) or 1.0
         image = axes[row, 0].imshow(np.fft.fftshift(weights), origin="lower", cmap="RdBu_r", vmin=-limit, vmax=limit, extent=(-half, half, -half, half))
-        axes[row, 0].set(title=rf"$\ell={ell:g}$: actual Poisson weights", xlabel="periodic x offset", ylabel="periodic y offset")
+        axes[row, 0].set(title=f"{condition_label(record)}: actual kernel weights", xlabel="periodic x offset", ylabel="periodic y offset")
         fig.colorbar(image, ax=axes[row, 0], shrink=0.8)
         radius, mass = _kernel_shells(weights)
         axes[row, 1].plot(radius * dx, mass, "o-", label="signed shell mass")

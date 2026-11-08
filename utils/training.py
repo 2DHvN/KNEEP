@@ -10,6 +10,10 @@ import torch
 from tqdm import trange
 
 from shell_force import ShellForceKNEEP2D
+from utils.video_data import ShardedVideo, video_channel_normalization
+
+
+Video = torch.Tensor | ShardedVideo
 
 
 @dataclass(frozen=True)
@@ -24,6 +28,9 @@ class TrainingConfig:
     gradient_clip: float = 1.0
     validate_every: int = 100
     train_fraction: float = 0.8
+    # None retains the historical single forward/backward per optimizer step.
+    # Smaller microbatches accumulate the same logical-batch mean gradient.
+    train_micro_batch_size: int | None = None
 
 
 @dataclass
@@ -48,35 +55,37 @@ def _alpha_terms(ep: torch.Tensor, alpha: float) -> torch.Tensor:
     ) / (1.0 + alpha)
 
 
+def _video_pairs(
+    video: Video,
+    ensemble: torch.Tensor,
+    time: torch.Tensor,
+) -> torch.Tensor:
+    if isinstance(video, ShardedVideo):
+        return video.fetch_pairs(ensemble, time)
+    return torch.stack((video[ensemble, time], video[ensemble, time + 1]), dim=1)
+
+
 def _normalized_pairs(
-    video: torch.Tensor,
+    video: Video,
     ensemble: torch.Tensor,
     time: torch.Tensor,
     mean: torch.Tensor,
     std: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
-    pair = torch.stack(
-        (video[ensemble, time], video[ensemble, time + 1]), dim=1
-    ).to(device=device, dtype=torch.float32)
+    pair = _video_pairs(video, ensemble, time).to(device=device, dtype=torch.float32)
     return (pair - mean) / std
 
 
-def channel_normalization(video: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute the notebook's per-channel normalization on CPU."""
-    if video.ndim != 5 or video.shape[1] < 2:
-        raise ValueError("expected video with shape [M, time>=2, C, H, W]")
-    mean = video.mean(dim=(0, 1, 3, 4), keepdim=True)
-    std = video.std(dim=(0, 1, 3, 4), keepdim=True, unbiased=True)
-    if torch.any(std <= 0):
-        raise RuntimeError("training data contain a zero-variance channel")
-    return mean, std
+def channel_normalization(video: Video) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute global per-channel sample moments with float64 CPU reductions."""
+    return video_channel_normalization(video)
 
 
 @torch.no_grad()
 def _validation_loss(
     model: ShellForceKNEEP2D,
-    video: torch.Tensor,
+    video: Video,
     mean: torch.Tensor,
     std: torch.Tensor,
     alpha: float,
@@ -101,8 +110,8 @@ def _validation_loss(
 
 
 def train_model(
-    train_video: torch.Tensor,
-    validation_video: torch.Tensor,
+    train_video: Video,
+    validation_video: Video,
     config: TrainingConfig,
     model_seed: int,
     device: torch.device | str,
@@ -115,6 +124,27 @@ def train_model(
     activation: str = "elu",
     normalization: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> TrainingResult:
+    """Fit on a dense movie or memory-mapped independent trajectory shards.
+
+    ``train_batch_size`` is the number of uniformly sampled transitions in an
+    optimizer step. ``train_micro_batch_size`` only limits activation memory:
+    losses are summed and divided by the logical batch size before backward,
+    gradients are clipped once, and AdamW takes exactly one step.  The model
+    has no batch normalization or dropout, so this preserves the objective.
+    """
+    if config.train_batch_size <= 0 or config.validation_batch_size <= 0:
+        raise ValueError("training and validation batch sizes must be positive")
+    if config.iterations <= 0 or config.validate_every <= 0:
+        raise ValueError("iterations and validate_every must be positive")
+    micro_batch_size = config.train_micro_batch_size or config.train_batch_size
+    if (config.train_micro_batch_size is not None
+            and config.train_micro_batch_size <= 0):
+        raise ValueError("train_micro_batch_size must be positive or None")
+    for video in (train_video, validation_video):
+        if video.ndim != 5 or video.shape[0] < 1 or video.shape[1] < 2:
+            raise ValueError("expected video with shape [M>=1,time>=2,C,H,W]")
+        if video.shape[2] != n_components:
+            raise ValueError("video channel count does not match n_components")
     target = torch.device(device)
     random.seed(model_seed)
     np.random.seed(model_seed)
@@ -174,16 +204,25 @@ def train_model(
             (config.train_batch_size,),
             generator=sampler,
         )
-        pair = _normalized_pairs(train_video, ensemble, time, mean, std, target)
-        ep = model(pair).sum(dim=1)
-        loss = _alpha_terms(ep, config.alpha).mean()
-
+        # Fetch once before slicing: otherwise random microbatches repeatedly
+        # reopen the same trajectory shards when the mapping cache is small.
+        pair_cpu = _video_pairs(train_video, ensemble, time)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        loss_value = torch.zeros((), device=target)
+        for start in range(0, config.train_batch_size, micro_batch_size):
+            pair = pair_cpu[start:start + micro_batch_size].to(
+                device=target, dtype=torch.float32
+            )
+            pair = (pair - mean) / std
+            ep = model(pair).sum(dim=1)
+            loss = _alpha_terms(ep, config.alpha).sum() / config.train_batch_size
+            loss.backward()
+            loss_value += loss.detach()
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
         optimizer.step()
 
-        if iteration == 1 or iteration % config.validate_every == 0:
+        if (iteration == 1 or iteration % config.validate_every == 0
+                or iteration == config.iterations):
             validation_loss = _validation_loss(
                 model,
                 validation_video,
@@ -194,7 +233,7 @@ def train_model(
                 target,
             )
             history_iterations.append(iteration)
-            train_losses.append(float(loss.detach().cpu()))
+            train_losses.append(float(loss_value.cpu()))
             validation_losses.append(validation_loss)
             if validation_loss < best_loss:
                 best_loss = validation_loss
@@ -223,7 +262,7 @@ def train_model(
 @torch.no_grad()
 def predict_epr_increments(
     result: TrainingResult,
-    video: torch.Tensor,
+    video: Video,
     batch_size: int,
     device: torch.device | str,
 ) -> np.ndarray:
@@ -253,7 +292,7 @@ def predict_epr_increments(
 @torch.no_grad()
 def predict_epr_branch_increments(
     result: TrainingResult,
-    video: torch.Tensor,
+    video: Video,
     batch_size: int,
     device: torch.device | str,
 ) -> np.ndarray:
@@ -282,7 +321,7 @@ def predict_epr_branch_increments(
 @torch.no_grad()
 def predict_epr_branch_maps(
     result: TrainingResult,
-    video: torch.Tensor,
+    video: Video,
     batch_size: int,
     device: torch.device | str,
 ) -> np.ndarray:
@@ -325,7 +364,7 @@ def predict_epr_branch_maps(
 @torch.no_grad()
 def predict_epr_component_maps(
     result: TrainingResult,
-    video: torch.Tensor,
+    video: Video,
     batch_size: int,
     device: torch.device | str,
 ) -> np.ndarray:
