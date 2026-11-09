@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
+from numbers import Integral
 
 import numpy as np
 import torch
@@ -31,6 +33,27 @@ class TrainingConfig:
     # None retains the historical single forward/backward per optimizer step.
     # Smaller microbatches accumulate the same logical-batch mean gradient.
     train_micro_batch_size: int | None = None
+    # The schedule counts optimizer updates, independently of microbatch size.
+    lr_scheduler: str = "none"
+    lr_min: float = 1e-5
+    lr_warmup_steps: int = 0
+
+    def __post_init__(self) -> None:
+        if self.lr_scheduler not in {"none", "cosine"}:
+            raise ValueError("lr_scheduler must be 'none' or 'cosine'")
+        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
+            raise ValueError("learning_rate must be finite and positive")
+        if not math.isfinite(self.lr_min) or self.lr_min < 0:
+            raise ValueError("lr_min must be finite and nonnegative")
+        if self.lr_scheduler != "none":
+            if self.lr_min > self.learning_rate:
+                raise ValueError("lr_min must not exceed learning_rate")
+            if (isinstance(self.lr_warmup_steps, bool)
+                    or not isinstance(self.lr_warmup_steps, Integral)
+                    or not 0 <= self.lr_warmup_steps < self.iterations):
+                raise ValueError(
+                    "lr_warmup_steps must be an integer in [0, iterations)"
+                )
 
 
 @dataclass
@@ -43,6 +66,33 @@ class TrainingResult:
     history_iterations: tuple[int, ...] = ()
     train_losses: tuple[float, ...] = ()
     validation_losses: tuple[float, ...] = ()
+    learning_rates: tuple[float, ...] = ()
+    best_learning_rate: float | None = None
+
+
+def _learning_rate_at_iteration(config: TrainingConfig, iteration: int) -> float:
+    """Learning rate used by the one-based optimizer update ``iteration``.
+
+    Linear warmup uses ``learning_rate / lr_warmup_steps`` on the first
+    update and reaches ``learning_rate`` on the last warmup update. Cosine
+    decay then reaches ``lr_min`` on the final update. Without warmup, the
+    first update uses ``learning_rate``; a one-update run uses ``lr_min``.
+    ``lr_min`` is the decay floor, so warmup may start below it.
+    """
+    if config.lr_scheduler == "none":
+        return config.learning_rate
+    warmup = config.lr_warmup_steps
+    if iteration <= warmup:
+        return config.learning_rate * iteration / warmup
+    if warmup:
+        phase = (iteration - warmup) / (config.iterations - warmup)
+    else:
+        phase = (iteration - 1) / max(config.iterations - 1, 1)
+        if config.iterations == 1:
+            phase = 1.0
+    return config.lr_min + 0.5 * (config.learning_rate - config.lr_min) * (
+        1.0 + math.cos(math.pi * phase)
+    )
 
 
 def _alpha_terms(ep: torch.Tensor, alpha: float) -> torch.Tensor:
@@ -131,6 +181,8 @@ def train_model(
     losses are summed and divided by the logical batch size before backward,
     gradients are clipped once, and AdamW takes exactly one step.  The model
     has no batch normalization or dropout, so this preserves the objective.
+    Optional linear warmup and cosine decay advance once per optimizer step;
+    checkpoint learning rates record the rate actually used by that update.
     """
     if config.train_batch_size <= 0 or config.validation_batch_size <= 0:
         raise ValueError("training and validation batch sizes must be positive")
@@ -180,10 +232,12 @@ def train_model(
     sampler.manual_seed(model_seed)
     best_loss = float("inf")
     best_iteration = 0
+    best_learning_rate: float | None = None
     best_state: dict[str, torch.Tensor] | None = None
     history_iterations: list[int] = []
     train_losses: list[float] = []
     validation_losses: list[float] = []
+    learning_rates: list[float] = []
 
     iterator = trange(
         1,
@@ -193,6 +247,9 @@ def train_model(
         disable=not progress,
     )
     for iteration in iterator:
+        learning_rate = _learning_rate_at_iteration(config, iteration)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = learning_rate
         model.train()
         ensemble = torch.randint(
             train_video.shape[0],
@@ -235,9 +292,11 @@ def train_model(
             history_iterations.append(iteration)
             train_losses.append(float(loss_value.cpu()))
             validation_losses.append(validation_loss)
+            learning_rates.append(learning_rate)
             if validation_loss < best_loss:
                 best_loss = validation_loss
                 best_iteration = iteration
+                best_learning_rate = learning_rate
                 best_state = {
                     name: value.detach().cpu().clone()
                     for name, value in model.state_dict().items()
@@ -256,6 +315,8 @@ def train_model(
         history_iterations=tuple(history_iterations),
         train_losses=tuple(train_losses),
         validation_losses=tuple(validation_losses),
+        learning_rates=tuple(learning_rates),
+        best_learning_rate=best_learning_rate,
     )
 
 

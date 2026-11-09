@@ -151,10 +151,15 @@ def dataset_preset(name: str = "demo") -> DatasetConfig:
         return DatasetConfig(burn_steps=16_000, sample_every=1,
                              train_trajectories=128, validation_trajectories=4,
                              test_trajectories=4, include_no_interaction=True)
+    if name == "production_v2":
+        # Increase independent trajectories while keeping observation cadence,
+        # dynamics and held-out test seeds identical to production.
+        return replace(dataset_preset("production"), train_trajectories=256,
+                       validation_trajectories=8)
     if name == "reference":
         return DatasetConfig(n=64, burn_steps=40_000, production_steps=64_000,
                              sample_every=40, blocks=8)
-    raise ValueError("preset must be quick, demo, refined, production or reference")
+    raise ValueError("preset must be quick, demo, refined, production, production_v2 or reference")
 
 
 def condition_id(ell: float) -> str:

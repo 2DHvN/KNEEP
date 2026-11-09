@@ -29,14 +29,15 @@ Move previous results aside before training with changed experiment settings.
 Open [demos/lramb_poisson_range.ipynb](demos/lramb_poisson_range.ipynb) for a
 Korean-language experiment with separate dataset generation, training and held-out
 evaluation cells. Figures are constructed with Matplotlib in notebook cells;
-evaluation saves numerical arrays and checkpoints, without rendering saved images.
+evaluation saves numerical arrays and checkpoints. The CLI `all` and `plot`
+stages also save PNG figures; the notebook constructs its own inline figures.
 
 The experiment uses the sibling `../LRAMB/lramb/model.py` solver and follows
 `LRAMB/poisson_ep.ipynb` / `lramb/range_sweep.py`: fresh dynamics for
 `ell=(1,2,4,8)`, `Khat(q)=exp(-ell*q)`, `Khat(0)=0`, fixed `g=0.35`, noisy stripe
 initialization, Euler–Maruyama dynamics and full-step midpoint entropy. Each
 trajectory seed is shared across ell values; train, validation and test seeds
-are independent. The default `production` profile also runs one **g=0
+are independent. The default `production_v2` profile also runs one **g=0
 (no long-range)** control, retaining the local bulk, gradient and active terms.
 No supervised EP labels are used for training.
 
@@ -44,19 +45,20 @@ From the parent workspace, run the three stages independently:
 
 ```bash
 python -m pip install -r KNEEP/requirements.txt
-python KNEEP/scripts/lramb_poisson_range.py generate --preset production --num-gpus 4
-python KNEEP/scripts/lramb_poisson_range.py train --preset production --num-gpus 4
-python KNEEP/scripts/lramb_poisson_range.py evaluate --preset production --num-gpus 4
-# Optional standalone Matplotlib display:
-python KNEEP/scripts/lramb_poisson_range.py plot --preset production
-# Or run generation, training and evaluation in sequence:
-python KNEEP/scripts/lramb_poisson_range.py all --preset production --num-gpus 4 --cpu-threads 1
+python KNEEP/scripts/lramb_poisson_range.py generate --preset production_v2 --num-gpus 4
+python KNEEP/scripts/lramb_poisson_range.py train --preset production_v2 --num-gpus 4
+python KNEEP/scripts/lramb_poisson_range.py evaluate --preset production_v2 --num-gpus 4
+# Save figures from cached evaluation arrays only (CPU; no re-evaluation):
+python KNEEP/scripts/lramb_poisson_range.py plot --preset production_v2
+# Or run generation, training, evaluation and figure export in sequence:
+python KNEEP/scripts/lramb_poisson_range.py all --preset production_v2 --num-gpus 4 --cpu-threads 1
 ```
 
 Only generation requires LRAMB (use `--lramb-root PATH` for another location).
 Training and evaluation operate entirely on saved datasets. The notebook also
 requires a Jupyter kernel (`python -m pip install jupyterlab ipykernel`). Outputs
-are under `KNEEP/results/lramb_poisson_range/<preset>/`. Matching completed runs
+use `KNEEP/results/lramb_poisson_production_v2_range15/` for the new default.
+Legacy profiles keep `KNEEP/results/lramb_poisson_range/<preset>/`. Matching completed runs
 are reused; incompatible settings require a new `--output-dir` or explicit
 `--force`. A training interruption restarts the unfinished repeat and keeps
 completed repeats.
@@ -66,7 +68,8 @@ completed repeats.
 | `quick` | 8 × 8 | 16 / 64 | 1 | 2 × 4 iterations |
 | `demo` | 32 × 32 | 4,000 / 8,192 | 8 | 3 × 2,000 iterations |
 | `refined` | 32 × 32 | 16,000 / 8,192 | 1 | 3 × 20,000 iterations |
-| `production` (default) | 32 × 32 | 16,000 / 8,192 | 1 | 3 × 10,000 iterations |
+| `production` | 32 × 32 | 16,000 / 8,192 | 1 | 3 × 10,000 iterations |
+| `production_v2` (default) | 32 × 32 | 16,000 / 8,192 | 1 | 3 × 10,000 iterations |
 | `reference` | 64 × 64 | 40,000 / 64,000 | 40 | 5 × 5,000 iterations |
 
 `quick` checks execution only. `demo` makes the complete workflow accessible;
@@ -77,14 +80,22 @@ configuration. CLI options include `--ells`, `--sample-every`, `--burn-steps`,
 `--production-steps`, `--iterations`, `--repeats`, `--max-distance`,
 `--train-trajectories`, `--validation-trajectories`, `--test-trajectories`,
 `--include-no-interaction` and `--no-include-no-interaction`.
-The default stage is `all`, preset is `production`, and device is `auto`.
+The default stage is `all`, preset is `production_v2`, and device is `auto`.
 `--batch-size` sets evaluation batches only; use `--train-batch-size` for
 training. `--min-train-pairs 1000000` can increase the trajectory count for
 custom observation protocols.
 
 Plots include cumulative EP in time and by receiving shell radius, time averaged
 EP maps, signed shell EP spectra with training-seed variation, temporal shell-rate
-variance, temporal PSD and the global EP response to ell. All temporal spectra
+variance, temporal PSD and the global EP response to ell. The fluctuation
+comparison overlays all ell conditions and the g=0 control on shared axes,
+with separate KNEEP and direct medium rows. Its three columns show
+`Var(j_rho)`, `Var(j_rho)/rho^2`, and
+`Var(sum_{0<rho<=R} j_rho)`. The local rho=0 branch is excluded from these
+panels. Signed sums precede variance, preserving cross-shell covariance.
+KNEEP bands show fit-seed SD after averaging independent test trajectories;
+medium-reference bands show test-trajectory SD. These are descriptive spreads,
+not confidence intervals. All temporal spectra
 are computed within individual held-out trajectories. Global variance/PSD sum
 signed branches before calculating statistics, preserving their covariance.
 Map contributions sum to the reported global rate; LRAMB density maps are
@@ -99,52 +110,62 @@ KNEEP's learned Chebyshev shell contributions are architecture-dependent, and ar
 compared with a physical kernel decomposition on the same shell geometry. They
 are not uniquely identifiable physical interactions. Conservative kernel EP is
 a free-energy boundary difference, so its stationary long-time mean vanishes.
-The production fitted radius is 12 lattice sites; inspect larger radii for omitted
+The production_v2 fitted radius is 15 lattice sites; inspect larger lattices for omitted
 tails. Wider Poisson kernels also attenuate nonzero Fourier modes at fixed g,
 so a monotonic EP increase is not assumed. Training-seed spread measures fitting
 variation conditional on fixed data; repeat the data sweep with independent
 seeds and inspect structural drift before making a stationary or significance
 claim.
 
-### Production run: million-pair datasets and a g=0 control
+### Production v2: more data, radius 15 and a learning-rate schedule
 
-The notebook and CLI now select `production`. The new large simulation and fits
+The notebook and CLI now select `production_v2`. The new large simulation and fits
 have not been run locally. Results go to
-`KNEEP/results/lramb_poisson_range/production/`; legacy profiles remain available.
+`KNEEP/results/lramb_poisson_production_v2_range15/`. The old `production`
+configuration and result directory remain available.
 
-| Setting | `production` |
-| --- | --- |
-| Observation stride / interval | 1 step / 0.01 |
-| Burn time / production time per trajectory | 160 / 81.92 |
-| Independent train / validation / test trajectories per condition | 128 / 4 / 4 |
-| Train pairs per condition | 128 × 8,192 = **1,048,576** |
-| Maximum learned shell radius | **12** (outer spatial footprint 25 × 25) |
-| Logical training batch | **1,024** |
-| Default GPU micro-batch | 128; gradients accumulated across 8 chunks |
-| AdamW learning rate / weight decay | **1e-3 / 1e-4** |
-| Optimizer iterations / independent fits | **10,000 / 3** |
-| Full validation every | 500 iterations |
+| Setting | `production` | `production_v2` |
+| --- | --- | --- |
+| Observation stride / interval | 1 step / 0.01 | 1 step / 0.01 |
+| Burn time / production time per trajectory | 160 / 81.92 | 160 / 81.92 |
+| Independent train / validation / test trajectories per condition | 128 / 4 / 4 | **256 / 8 / 4** |
+| Train pairs per condition | 1,048,576 | **2,097,152** |
+| Maximum learned shell radius | 12 (25 × 25) | **15 (31 × 31)** |
+| Logical training batch | 1,024 | **1,024** |
+| Default GPU micro-batch | 128 | 128; gradients accumulated across 8 chunks |
+| AdamW peak learning rate / weight decay | 1e-3 / 1e-4 | **1e-3 / 1e-4** |
+| Learning-rate schedule | fixed | **500-step warmup, then cosine to 1e-5** |
+| Optimizer iterations / independent fits | 10,000 / 3 | **10,000 / 3** |
+| Full validation every | 500 iterations | 500 iterations |
 
-Width 32, depth 2, ELU and alpha=-0.5 remain unchanged. Radius 12 means the
+Width 32, depth 2, ELU and alpha=-0.5 remain unchanged. Radius 15 means the
 maximum Chebyshev shell distance, matching the model's `max_distance` setting.
+For n=32 this is almost the entire periodic lattice; the radius-16 opposite
+row/column is excluded. The scheduler advances once per optimizer step, not
+once per micro-batch. Physical parameters, solver step and observation cadence
+are unchanged.
 The logical batch is sampled once and divided into GPU micro-batches, with
 the same objective scaling and one optimizer step per 1,024 pairs. Set
 `--train-micro-batch-size 1024` to process the entire batch at once if GPU memory
 allows. The optimizer and architecture can also be set explicitly:
 
 ```bash
-python KNEEP/scripts/lramb_poisson_range.py all --preset production --num-gpus 4 \
-  --max-distance 12 --train-batch-size 1024 --train-micro-batch-size 128 \
-  --learning-rate 1e-3 --weight-decay 1e-4 --iterations 10000 --cpu-threads 1
+python KNEEP/scripts/lramb_poisson_range.py all --preset production_v2 --num-gpus 4 \
+  --max-distance 15 --train-batch-size 1024 --train-micro-batch-size 128 \
+  --learning-rate 1e-3 --weight-decay 1e-4 --iterations 10000 \
+  --lr-scheduler cosine --lr-warmup-steps 500 --lr-min 1e-5 --cpu-threads 1
 ```
 
 Each trajectory is saved as a `.pt` float32 movie shard and loaded through
 `torch.load(..., mmap=True)`; split JSON indexes identify the shards. Training
 reads selected pairs rather than copying the full million-pair
-dataset into RAM or GPU memory. Train movies use approximately **4.30 GB per
-condition**, **21.5 GB for five conditions**, or **22.8 GB including validation
-and test**, plus smaller metadata, reference arrays and checkpoints. Consecutive
-pairs are temporally correlated: one million pairs is not one million
+dataset into RAM or GPU memory. New train movies use approximately **8.59 GB per
+condition**, **43.0 GB for five conditions**, or **45.0 GB including validation
+and test**, plus reference arrays, metadata and checkpoints. Train-movie storage
+is twice the old production profile. Memory mapping still uses the OS page
+cache, while model activations and work buffers use RAM/VRAM; it does not
+guarantee a fixed total memory bound. Consecutive
+pairs are temporally correlated: two million pairs is not two million
 independent observations.
 
 The additional condition is saved as `no_interaction`, with metadata `ell=0`
@@ -178,16 +199,45 @@ sbatch scripts/lramb_poisson_range.slurm
 
 The SLURM file requests one task, four GPUs, four CPUs and 32 GB RAM, excludes
 `gpu1`, and uses the Python and Matplotlib cache paths supplied for the server.
-It runs `all --preset production --num-gpus 4`; it does not launch plotting or
-require an interactive display. The job script has been written but not
+It runs `all --preset production_v2 --num-gpus 4` and saves PNG figures after
+evaluation, using a noninteractive backend. The job script has been written but not
 submitted from this workspace.
+
+### Redraw old results without new training or evaluation
+
+`plot` reads saved `evaluation/*.npz` files directly, preserving their original
+fit settings and radius even when current source code has changed. It requires
+neither a GPU nor the original training movies or checkpoints. Missing or
+malformed evaluation records raise an error; the plot command does not silently
+regenerate them. Existing production results can immediately use the new
+across-range fluctuation overlays:
+
+Keep `dataset.json` and `training.json` beside the saved evaluation directory;
+the loader checks that these provenance manifests match the records.
+
+```bash
+python KNEEP/scripts/lramb_poisson_range.py plot \
+  --output-dir KNEEP/results/lramb_poisson_range/production
+# Optional destination and interactive display:
+python KNEEP/scripts/lramb_poisson_range.py plot \
+  --output-dir KNEEP/results/lramb_poisson_range/production \
+  --figure-dir KNEEP/results/lramb_poisson_range/production/new_figures --show
+```
+
+Both `all` and `plot` save PNGs under `<output-dir>/figures/` by default;
+`--figure-dir PATH` overrides this destination. `evaluate` saves arrays only.
+The notebook similarly calls `load_evaluation_records(OUTPUT_DIR)` by default.
+Set `KNEEP_POISSON_OUTPUT_DIR` to the old folder and run setup, configuration,
+cached-evaluation and figure cells, skipping generation and training. Set
+`FORCE_EVALUATE=True` only when new predictions are intended; otherwise missing
+saved results instruct the user to run evaluation first.
 
 At stationarity the mean system-entropy boundary increment vanishes. A sustained
 mean-rate gap therefore cannot be assigned solely to system entropy. Finite
 observation intervals, nonstationarity, discrete-time errors and the restricted
 force family also matter. Each nonlocal branch sees only its own shell, so the
 additive branches cannot in general express center-neighbor products in the
-AMB force. The production settings do not resolve that architectural restriction
+AMB force. The production_v2 settings do not resolve that architectural restriction
 or guarantee agreement with the medium reference. For the inference and
 sampling assumptions, see [Otsubo et al. (2022)](https://www.nature.com/articles/s42005-021-00787-x)
 and [Kwon and Baek (2024)](https://doi.org/10.1103/PhysRevE.109.014143).
@@ -218,7 +268,7 @@ Regenerate into a fresh directory, for example by setting the following in
 the configuration cell:
 
 ```python
-OUTPUT_DIR = KNEEP_ROOT / "results" / "lramb_poisson_range" / "production_v3_shards"
+OUTPUT_DIR = KNEEP_ROOT / "results" / "lramb_poisson_production_v2_range15"
 ```
 
 Existing caches have different solver/generator signatures and are not reused.

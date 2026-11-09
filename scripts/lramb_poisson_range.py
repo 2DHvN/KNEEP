@@ -79,10 +79,16 @@ def fit_preset(name: str) -> FitConfig:
             prediction_batch_size=128, learning_rate=1e-3, weight_decay=1e-4,
             validate_every=500,
         ))
+    if name == "production_v2":
+        previous = fit_preset("production")
+        return replace(previous, max_distance=15, training=replace(
+            previous.training, lr_scheduler="cosine", lr_warmup_steps=500,
+            lr_min=1e-5,
+        ))
     if name == "reference":
         return FitConfig(hidden_layers=3, repeats=5,
             training=replace(FitConfig().training, iterations=5_000))
-    raise ValueError("preset must be quick, demo, refined, production or reference")
+    raise ValueError("preset must be quick, demo, refined, production, production_v2 or reference")
 
 
 def _device(value: str | torch.device) -> torch.device:
@@ -304,8 +310,10 @@ def _train_repeat(task: dict, target: torch.device) -> dict:
         model_state={key: val.detach().cpu() for key, val in result.model.state_dict().items()},
         mean=result.mean.detach().cpu(), std=result.std.detach().cpu(),
         best_iteration=result.best_iteration, best_validation_loss=result.best_validation_loss,
+        best_learning_rate=result.best_learning_rate,
         history=dict(iterations=list(result.history_iterations),
-            train_losses=list(result.train_losses), validation_losses=list(result.validation_losses)),
+            train_losses=list(result.train_losses), validation_losses=list(result.validation_losses),
+            learning_rates=list(result.learning_rates)),
     ))
     return dict(checkpoint=str(path), reused=False)
 
@@ -421,10 +429,11 @@ def _save_record(path: Path, record: dict, signature: str) -> None:
     temporary.replace(path)
 
 
-def _load_record(path: Path, signature: str) -> dict | None:
+def _load_record(path: Path, signature: str | None = None) -> dict | None:
     with np.load(path, allow_pickle=False) as stored:
         metadata = json.loads(str(stored["metadata"]))
-        if metadata.pop("signature") != signature:
+        saved_signature = metadata.pop("signature")
+        if signature is not None and saved_signature != signature:
             return None
         record = {key: stored[key].copy() for key in stored.files
                   if key != "metadata" and not key.startswith("diagnostic_")}
@@ -432,6 +441,47 @@ def _load_record(path: Path, signature: str) -> dict | None:
         record["diagnostics"] = {key.removeprefix("diagnostic_"): stored[key].copy()
                                   for key in stored.files if key.startswith("diagnostic_")}
         return record
+
+
+def load_evaluation_records(output_dir: str | Path) -> list[dict]:
+    """Read saved evaluation arrays without inference, CUDA or LRAMB.
+
+    Dataset/training provenance must match the saved manifests. Unlike a new
+    evaluation, redrawing an existing result does not require the current
+    training source hash to equal the source used for that historical fit.
+    """
+    folder = Path(output_dir)
+    data = _complete_dataset(folder)
+    training = json.loads((folder / "training.json").read_text(encoding="utf-8"))
+    if not training.get("complete") or training["dataset_signature"] != data["signature"]:
+        raise ValueError("complete matching training is required to load saved evaluation")
+    records = []
+    for condition in data["conditions"]:
+        cid = condition["condition_id"]
+        path = folder / "evaluation" / f"{cid}.npz"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"saved evaluation is missing: {path}; run the evaluate stage first"
+            )
+        record = _load_record(path)
+        provenance = record.get("metadata", {})
+        if (provenance.get("dataset_signature") != data["signature"]
+                or provenance.get("training_signature") != training["signature"]
+                or float(record["ell"]) != float(condition["ell"])
+                or record.get("condition_id", cid) != cid):
+            raise ValueError(f"saved evaluation does not match its manifests: {path}")
+        predicted = record["predicted_increment"]
+        reference = record["reference_increment"]
+        shells = record["reference_branch_increment"]
+        if (predicted.ndim != 4 or reference.ndim != 3 or shells.ndim != 3
+                or predicted.shape[1:3] != reference.shape[:2]
+                or shells.shape[:2] != reference.shape[:2]
+                or predicted.shape[0] != training["config"]["repeats"]
+                or predicted.shape[-1] != training["config"]["max_distance"] + 1
+                or not np.isfinite(record["interval"]) or record["interval"] <= 0):
+            raise ValueError(f"invalid saved evaluation dimensions or cadence: {path}")
+        records.append(record)
+    return records
 
 
 def _evaluate_condition(task: dict, target: torch.device) -> dict:
@@ -560,12 +610,45 @@ def _execution_devices(args) -> tuple[str, ...]:
     return (str(target),) * count
 
 
+def save_figures(records: list[dict], figure_dir: str | Path, *, show=False) -> None:
+    """Render stored arrays on CPU, saving every diagnostic as a PNG."""
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from utils.poisson_range_plots import (
+        plot_cumulative_ep, plot_time_averaged_ep, plot_ep_spectrum,
+        plot_temporal_spectrum, plot_range_response, plot_training_history,
+        plot_kernel_diagnostics, plot_fluctuation_comparison,
+    )
+    folder = Path(figure_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, plot in (
+        ("kernel_diagnostics", plot_kernel_diagnostics),
+        ("training_history", plot_training_history),
+        ("cumulative_ep", plot_cumulative_ep),
+        ("time_averaged_ep", plot_time_averaged_ep),
+        ("fluctuation_comparison", plot_fluctuation_comparison),
+        ("ep_spectrum", plot_ep_spectrum),
+        ("temporal_spectrum", plot_temporal_spectrum),
+        ("range_response", plot_range_response),
+    ):
+        figure = plot(records)
+        path = folder / f"{name}.png"
+        figure.savefig(path, dpi=160, bbox_inches="tight")
+        print(f"Figure: {path}", flush=True)
+        if not show:
+            plt.close(figure)
+    if show:
+        plt.show()
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", nargs="?", default="all",
                         choices=("all", "generate", "train", "evaluate", "plot"))
-    parser.add_argument("--preset", choices=("quick", "demo", "refined", "production", "reference"),
-                        default="production")
+    parser.add_argument("--preset", choices=("quick", "demo", "refined", "production", "production_v2", "reference"),
+                        default="production_v2")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--lramb-root", type=Path)
     placement = parser.add_mutually_exclusive_group()
@@ -579,11 +662,14 @@ def main(argv=None) -> None:
                         default=None, help="include one g=0 no-long-range control")
     parser.add_argument("--iterations", type=int)
     parser.add_argument("--repeats", type=int)
-    parser.add_argument("--max-distance", type=int, help="maximum shell radius; 12 means a 25x25 outer stencil")
+    parser.add_argument("--max-distance", type=int, help="maximum shell radius; 15 means a 31x31 outer stencil")
     parser.add_argument("--train-batch-size", type=int, help="logical number of transition pairs per optimizer step")
     parser.add_argument("--train-micro-batch-size", type=int,
                         help="GPU chunk size with exact gradient accumulation within the logical batch")
     parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--lr-scheduler", choices=("none", "cosine"))
+    parser.add_argument("--lr-min", type=float, help="final learning rate for cosine decay")
+    parser.add_argument("--lr-warmup-steps", type=int, help="linear warmup optimizer updates before cosine decay")
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--validate-every", type=int)
     parser.add_argument("--sample-every", type=int)
@@ -600,15 +686,24 @@ def main(argv=None) -> None:
     parser.add_argument("--cpu-threads", type=int, default=1)
     parser.add_argument("--force", action="store_true", help="explicitly replace incompatible stage artifacts")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--figure-dir", type=Path, help="PNG destination for all/plot; default OUTPUT_DIR/figures")
+    parser.add_argument("--show", action="store_true", help="also display figures interactively in all/plot")
     args = parser.parse_args(argv)
     if args.cpu_threads < 1 or args.shard_cache_size < 1:
         parser.error("--cpu-threads and --shard-cache-size must be positive")
+    torch.set_num_threads(args.cpu_threads)
+    default_output = (ROOT / "results" / "lramb_poisson_production_v2_range15"
+                      if args.preset == "production_v2"
+                      else ROOT / "results" / "lramb_poisson_range" / args.preset)
+    output = args.output_dir or default_output
+    if args.stage == "plot":
+        records = load_evaluation_records(output)
+        save_figures(records, args.figure_dir or output / "figures", show=args.show)
+        return
     try:
         devices = _execution_devices(args)
     except (ValueError, RuntimeError) as error:
         parser.error(str(error))
-    torch.set_num_threads(args.cpu_threads)
-    output = args.output_dir or ROOT / "results" / "lramb_poisson_range" / args.preset
     data_config, fit_config = dataset_preset(args.preset), fit_preset(args.preset)
     data_overrides = {name: getattr(args, name) for name in (
         "sample_every", "burn_steps", "production_steps", "train_trajectories",
@@ -625,7 +720,7 @@ def main(argv=None) -> None:
             math.ceil(args.min_train_pairs / (data_config.production_steps // data_config.sample_every))))
     optimizer_overrides = {name: getattr(args, name) for name in (
         "iterations", "train_batch_size", "train_micro_batch_size", "learning_rate",
-        "weight_decay", "validate_every",
+        "weight_decay", "validate_every", "lr_scheduler", "lr_min", "lr_warmup_steps",
     ) if getattr(args, name) is not None}
     fit_config = replace(fit_config, training=replace(fit_config.training, **optimizer_overrides),
         **{name: getattr(args, name) for name in ("repeats", "max_distance")
@@ -639,6 +734,8 @@ def main(argv=None) -> None:
           f"logical batch={fit_config.training.train_batch_size}, "
           f"microbatch={fit_config.training.train_micro_batch_size}, "
           f"radius={fit_config.max_distance}, iterations={fit_config.training.iterations}")
+    print(f"LR: {fit_config.training.lr_scheduler}; initial={fit_config.training.learning_rate:g}, "
+          f"warmup={fit_config.training.lr_warmup_steps}, minimum={fit_config.training.lr_min:g}")
     if args.stage in {"all", "generate"}:
         generate_sweep(data_config, output, lramb_root=args.lramb_root,
             devices=devices, cpu_threads=args.cpu_threads, force=args.force, progress=not args.quiet)
@@ -647,25 +744,14 @@ def main(argv=None) -> None:
         train_sweep(output, fit_config, devices=devices, cpu_threads=args.cpu_threads,
             shard_cache_size=args.shard_cache_size, force=args.force, progress=not args.quiet)
         print(f"Training complete: {output}")
-    if args.stage in {"all", "evaluate", "plot"}:
+    if args.stage in {"all", "evaluate"}:
         records = evaluate_sweep(output, devices=devices, batch_size=prediction_batch,
             cpu_threads=args.cpu_threads, progress=not args.quiet, force=args.force)
-        if args.stage == "plot":
-            import matplotlib.pyplot as plt
-            from utils.poisson_range_plots import (
-                plot_cumulative_ep, plot_time_averaged_ep, plot_ep_spectrum,
-                plot_temporal_spectrum, plot_range_response, plot_training_history,
-                plot_kernel_diagnostics,
-            )
-            for plot in (plot_kernel_diagnostics, plot_training_history, plot_cumulative_ep,
-                         plot_time_averaged_ep, plot_ep_spectrum, plot_temporal_spectrum,
-                         plot_range_response):
-                plot(records)
-            plt.show()
-            return
         for record in records:
             print(f"{record.get('label', record['ell'])}: predictions {record['predicted_increment'].shape}")
         print(f"Evaluation arrays: {output / 'evaluation'}; open demos/lramb_poisson_range.ipynb for inline plots")
+        if args.stage == "all":
+            save_figures(records, args.figure_dir or output / "figures", show=args.show)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,31 @@ def _records(records: Records) -> list[Mapping[str, Any]]:
     return result
 
 
+def _condition_colors(records: Records) -> list[Any]:
+    """Keep physical ranges on one palette and the g=0 control gray."""
+    interacting = [record for record in records
+                   if not (record.get("is_control") or float(record["ell"]) == 0)]
+    palette = iter(plt.get_cmap("viridis")(np.linspace(0.1, 0.85, len(interacting))))
+    return ["0.45" if record.get("is_control") or float(record["ell"]) == 0
+            else next(palette) for record in records]
+
+
+def _nonnegative_scale(axes: Sequence[Any], values: Sequence[np.ndarray]) -> None:
+    """Use matched symlog limits, retaining exact zeros as plotted zeros."""
+    maximum = 0.0
+    for value in values:
+        array = _array(value)
+        if not np.isfinite(array).all():
+            raise ValueError("Fluctuation summaries contain nonfinite values")
+        if array.size:
+            maximum = max(maximum, float(array.max()))
+    threshold = maximum * 1e-6 if maximum > 0 else 1.0
+    upper = maximum * 1.2 if maximum > 0 else 1.0
+    for ax in axes:
+        ax.set_yscale("symlog", linthresh=threshold)
+        ax.set_ylim(0, upper)
+
+
 def _increments(record: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, float]:
     predicted = _array(record["predicted_increment"])
     reference = _array(record["reference_increment"])
@@ -210,6 +235,83 @@ def plot_ep_spectrum(records: Records) -> Figure:
     return fig
 
 
+def plot_fluctuation_comparison(records: Records) -> Figure:
+    """Overlay interaction ranges, with learned and direct gauges in two rows.
+
+    Rates are saved increments divided by the physical observation interval.
+    All panels omit radius zero. The last column sums SIGNED nonlocal shell
+    rates before taking the temporal variance, retaining their covariances.
+    Variance is computed within each trajectory (ddof=0), then averaged over
+    trajectories and, for KNEEP, fit seeds. Bands are descriptive standard
+    deviations across fit seeds (top) or trajectories (bottom), not CIs.
+
+    Direct values are midpoint medium entropy from the simulated fields, not
+    exact stationary path entropy. Learned branches and physical kernel shells
+    have different gauges and may have different maximum radii.
+    """
+    records = _records(records)
+    colors = _condition_colors(records)
+    fig, axes = plt.subplots(2, 3, figsize=(15.5, 8), sharex="col", sharey="col")
+    maxima: list[list[np.ndarray]] = [[], [], []]
+    titles = (r"Shell variance: $\mathrm{Var}_t(j_\rho)$",
+              r"Distance scaling: $\mathrm{Var}_t(j_\rho)/\rho^2$",
+              r"Cumulative variance: $\mathrm{Var}_t(\sum_{0<\rho\leq R}j_\rho)$")
+    for color, record in zip(colors, records):
+        predicted, _, interval = _increments(record)
+        direct = _array(record["reference_branch_increment"])
+        if direct.ndim != 3 or direct.shape[:2] != predicted.shape[1:3]:
+            raise ValueError("Physical shell increments must match prediction trajectories and times")
+        dx = float(record["dx"])
+        if not np.isfinite(dx) or dx <= 0:
+            raise ValueError("dx must be positive and finite")
+        learned_rate, direct_rate = predicted[..., 1:] / interval, direct[..., 1:] / interval
+        radii = (np.arange(1, predicted.shape[-1]) * dx,
+                 np.arange(1, direct.shape[-1]) * dx)
+        # Keep independent trajectories separate, and retain fit-seed variation.
+        learned_shell = np.var(learned_rate, axis=2, ddof=0).mean(axis=1)
+        direct_shell = np.var(direct_rate, axis=1, ddof=0)
+        learned_cumulative = np.var(np.cumsum(learned_rate, axis=-1), axis=2, ddof=0).mean(axis=1)
+        direct_cumulative = np.var(np.cumsum(direct_rate, axis=-1), axis=1, ddof=0)
+        statistics = (
+            (learned_shell, learned_shell / radii[0] ** 2, learned_cumulative),
+            (direct_shell, direct_shell / radii[1] ** 2, direct_cumulative),
+        )
+        for row in range(2):
+            for col, samples in enumerate(statistics[row]):
+                mean, spread = samples.mean(axis=0), _std(samples, axis=0)
+                axes[row, col].plot(radii[row], mean, "o-", markersize=3,
+                                    color=color, label=condition_label(record))
+                lower, upper = np.maximum(mean - spread, 0), mean + spread
+                axes[row, col].fill_between(radii[row], lower, upper,
+                                           color=color, alpha=0.13)
+                maxima[col].append(upper)
+    for col in range(3):
+        _nonnegative_scale(axes[:, col], maxima[col])
+        for row in range(2):
+            method = "KNEEP" if row == 0 else "Direct medium reference"
+            axes[row, col].set_title(f"{method}\n{titles[col]}", fontsize=11)
+            axes[row, col].set_xlabel("Chebyshev radius R (physical length)" if col == 2
+                                      else "Chebyshev shell radius rho (physical length)")
+            axes[row, col].set_ylabel("Var(EP / time) / length squared" if col == 1
+                                      else "Var(EP / time)")
+            axes[row, col].set_xlim(left=0)
+            _style(axes[row, col])
+    axes[0, 0].text(0.98, 0.97, "band: fit-seed SD", transform=axes[0, 0].transAxes,
+                    ha="right", va="top", fontsize=8)
+    axes[1, 0].text(0.98, 0.97, "band: independent-trajectory SD",
+                    transform=axes[1, 0].transAxes, ha="right", va="top", fontsize=8)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.955),
+               ncol=min(len(records), 5), fontsize=9)
+    fig.suptitle("Interaction-range dependence of nonlocal shell fluctuations", y=0.995, fontsize=14)
+    fig.text(0.5, 0.025,
+             "All panels omit rho=0; cumulative sums contain only 0<rho<=R. Rates use increment / saved interval, with no further rescaling.\n"
+             "The two decompositions have different gauges. Direct midpoint medium EP is not exact stationary total EP; shared symlog scales retain zeros.",
+             ha="center", va="bottom", fontsize=8.5)
+    fig.tight_layout(rect=(0, 0.075, 1, 0.91))
+    return fig
+
+
 def _periodogram(rate: np.ndarray, interval: float) -> tuple[np.ndarray, np.ndarray]:
     """One-sided density, independently detrended along each final time axis."""
     count = rate.shape[-1]
@@ -223,43 +325,75 @@ def _periodogram(rate: np.ndarray, interval: float) -> tuple[np.ndarray, np.ndar
 
 
 def plot_temporal_spectrum(records: Records) -> Figure:
-    """Global-rate PSD and variance with all branch covariances retained."""
+    """Across-range PSD and TOTAL-rate variance, in separate method rows.
+
+    Unlike ``plot_fluctuation_comparison``, these global statistics include
+    radius zero, all nonlocal shells, and active/local reference components.
+    Signed contributions are summed before periodograms or variances, and
+    independent trajectories are never concatenated across boundaries.
+    """
     records = _records(records)
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.7))
-    colors = plt.get_cmap("viridis")(np.linspace(0.1, 0.85, len(records)))
-    ells, learned_variances, learned_seed_sd, learned_trajectory_sd, reference_variances = [], [], [], [], []
-    for color, record in zip(colors, records):
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex="col", sharey="col")
+    colors = _condition_colors(records)
+    psd_limits, variance_limits = [], []
+    for index, (color, record) in enumerate(zip(colors, records)):
         prediction, reference, interval = _increments(record)
-        # Sum first: var(sum(branches)) retains cross-branch covariances.
         total_rate = prediction.sum(-1) / interval
-        ref_rate = reference.sum(-1) / interval
+        direct_rate = reference.sum(-1) / interval
         frequency, psd = _periodogram(total_rate, interval)
-        _, reference_psd = _periodogram(ref_rate, interval)
-        mean_psd = psd.mean((0, 1))
-        seed_psd_spread = _std(psd.mean(1))
-        ell = float(record["ell"])
-        axes[0].plot(frequency[1:], mean_psd[1:], color=color, label=f"{condition_label(record)} KNEEP")
-        axes[0].fill_between(frequency[1:], np.maximum(mean_psd[1:] - seed_psd_spread[1:], 1e-30), mean_psd[1:] + seed_psd_spread[1:], color=color, alpha=0.13)
-        axes[0].plot(frequency[1:], reference_psd.mean(0)[1:], color=color, linestyle="--", alpha=0.8)
-        variance = np.var(total_rate, axis=-1)
-        ells.append(ell)
-        learned_variances.append(variance.mean())
-        learned_seed_sd.append(_std(variance.mean(1)))
-        learned_trajectory_sd.append(_std(variance.mean(0)))
-        reference_variances.append(np.var(ref_rate, axis=-1).mean())
-    axes[0].set(xlabel="frequency (1 / time)", ylabel="PSD of global EP rate", xscale="log", yscale="log", title="Per-trajectory periodograms; no boundary concatenation")
-    axes[0].legend(fontsize=8)
-    axes[0].text(0.02, 0.02, "solid: KNEEP; dashed: medium reference\nband: fit-seed SD; DC removed", transform=axes[0].transAxes, fontsize=8)
-    positions = np.arange(len(records))
-    axes[1].errorbar(positions, learned_variances, yerr=learned_trajectory_sd, fmt="o", color=_TRAJECTORY, capsize=5, label="independent trajectory SD")
-    axes[1].errorbar(positions, learned_variances, yerr=learned_seed_sd, fmt="o", color=_LEARNED, capsize=2, label="KNEEP mean +/- fit-seed SD")
-    axes[1].plot(positions, reference_variances, "s", color=_REFERENCE, label="medium reference")
-    axes[1].set(ylabel="mean within-trajectory Var(global EP / time)", title="Global temporal variation; branch covariances included")
-    _condition_axis(axes[1], records)
-    axes[1].legend(fontsize=8)
-    for ax in axes:
-        _style(ax, zero=False)
-    fig.tight_layout()
+        direct_frequency, direct_psd = _periodogram(direct_rate, interval)
+        # Top: average trajectories within each fit seed before seed SD.
+        # Bottom: direct trajectory SD, without a learned-seed dimension.
+        summaries = ((psd.mean(axis=1), frequency), (direct_psd, direct_frequency))
+        for row, (samples, frequencies) in enumerate(summaries):
+            mean, spread = samples.mean(axis=0), _std(samples, axis=0)
+            selected = slice(1, None)  # DC is zero after per-trajectory demeaning.
+            axes[row, 0].plot(frequencies[selected], mean[selected], color=color,
+                              linewidth=1.1, label=condition_label(record))
+            lower, upper = np.maximum(mean - spread, 0), mean + spread
+            axes[row, 0].fill_between(frequencies[selected], lower[selected], upper[selected],
+                                     color=color, alpha=0.12)
+            psd_limits.append(upper[selected])
+        variance = np.var(total_rate, axis=-1, ddof=0)
+        mean = float(variance.mean())
+        seed_sd = float(_std(variance.mean(axis=1)))
+        trajectory_sd = float(_std(variance.mean(axis=0)))
+        axes[0, 1].errorbar(index, mean, yerr=trajectory_sd, fmt="none",
+                            color=_TRAJECTORY, capsize=6,
+                            label="independent-trajectory SD" if index == 0 else None)
+        axes[0, 1].errorbar(index, mean, yerr=seed_sd, fmt="o", color=color,
+                            capsize=3, label="fit-seed SD" if index == 0 else None)
+        direct_variance = np.var(direct_rate, axis=-1, ddof=0)
+        direct_mean, direct_sd = float(direct_variance.mean()), float(_std(direct_variance))
+        axes[1, 1].errorbar(index, direct_mean, yerr=direct_sd, fmt="o", color=color,
+                            capsize=5, label="independent-trajectory SD" if index == 0 else None)
+        variance_limits.extend((np.asarray([mean + max(seed_sd, trajectory_sd)]),
+                                np.asarray([direct_mean + direct_sd])))
+    _nonnegative_scale(axes[:, 0], psd_limits)
+    _nonnegative_scale(axes[:, 1], variance_limits)
+    for row, method in enumerate(("KNEEP", "Direct midpoint medium reference")):
+        axes[row, 0].set(title=f"{method}: global-rate PSD", xlabel="frequency (1 / time)",
+                         ylabel="PSD of total EP rate", xscale="log")
+        axes[row, 1].set(title=f"{method}: total temporal variance",
+                         ylabel="mean within-trajectory Var(total EP / time)")
+        _condition_axis(axes[row, 1], records)
+        axes[row, 1].legend(fontsize=8)
+        for ax in axes[row]:
+            _style(ax, zero=False)
+    axes[0, 0].text(0.02, 0.98, "band: fit-seed SD", transform=axes[0, 0].transAxes,
+                    va="top", fontsize=8)
+    axes[1, 0].text(0.02, 0.98, "band: independent-trajectory SD",
+                    transform=axes[1, 0].transAxes, va="top", fontsize=8)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.955),
+               ncol=min(len(records), 5), fontsize=9)
+    fig.suptitle("Global fluctuations across interaction ranges, including all local and active terms",
+                 fontsize=13, y=0.995)
+    fig.text(0.5, 0.02,
+             "Signed contributions are summed before statistics. Periodograms are demeaned separately per trajectory; DC omitted.\n"
+             "Shared symlog scales; bands/error bars are descriptive SDs. Direct medium EP is not exact stationary total EP.",
+             ha="center", va="bottom", fontsize=8.5)
+    fig.tight_layout(rect=(0, 0.075, 1, 0.91))
     return fig
 
 
@@ -275,7 +409,7 @@ def plot_range_response(records: Records) -> Figure:
     """Summary of range manipulation and learned response, without trend assumptions."""
     records = _records(records)
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
-    colors = plt.get_cmap("viridis")(np.linspace(0.1, 0.85, len(records)))
+    colors = _condition_colors(records)
     ells, mean_rates, seed_sd, trajectory_sd, medium_rates = [], [], [], [], []
     for color, record in zip(colors, records):
         prediction, reference, interval = _increments(record)
@@ -322,17 +456,42 @@ def plot_range_response(records: Records) -> Figure:
 
 
 def plot_training_history(records: Records) -> Figure:
-    """Training and held-out validation losses for every independent fit seed."""
+    """Training/validation losses, plus recorded learning rates when available.
+
+    Learning-rate values must align with each fit's recorded iterations. Old
+    checkpoints lacking them retain the original single-axis loss plot.
+    """
     records = _records(records)
     columns = min(2, len(records))
     rows = (len(records) + columns - 1) // columns
     fig, axes = plt.subplots(rows, columns, figsize=(12, 3.7 * rows), squeeze=False)
     for ax, record in zip(axes.flat, records):
+        lr_ax = None
         for repeat, history in enumerate(record.get("history", [])):
             iterations = _array(history["iterations"])
             color = f"C{repeat % 10}"
             ax.plot(iterations, _array(history["train_losses"]), color=color, alpha=0.35, linewidth=0.8)
             ax.plot(iterations, _array(history["validation_losses"]), color=color, label=f"fit seed {repeat}: validation")
+            learning_rates = history.get("learning_rates")
+            if learning_rates is None and record.get("learning_rates") is not None:
+                saved = _array(record["learning_rates"])
+                if saved.ndim == 1:
+                    learning_rates = saved
+                elif saved.ndim == 2 and repeat < saved.shape[0]:
+                    learning_rates = saved[repeat]
+            if learning_rates is not None:
+                values = _array(learning_rates)
+                if values.shape == iterations.shape and values.size:
+                    if not np.isfinite(values).all() or np.any(values < 0):
+                        raise ValueError("Recorded learning rates must be finite and nonnegative")
+                    if lr_ax is None:
+                        lr_ax = ax.twinx()
+                        lr_ax.set_ylabel("learning rate (dashed)", fontsize=8)
+                        lr_ax.tick_params(labelsize=8)
+                        lr_ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+                    lr_ax.plot(iterations, values, color=color, linestyle="--",
+                               linewidth=0.9, alpha=0.55)
+                    lr_ax.set_ylim(bottom=0)
         ax.set(title=f"{condition_label(record)}; faint = sampled training loss", xlabel="optimizer iteration", ylabel="alpha-divergence objective")
         _style(ax)
         if record.get("history"):

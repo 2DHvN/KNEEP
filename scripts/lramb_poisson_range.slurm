@@ -22,10 +22,12 @@ export NUMEXPR_NUM_THREADS=1
 
 # One SLURM task starts one experiment worker per visible GPU. Each model is
 # fitted on one GPU; condition/fit-seed jobs run independently in parallel.
-# The production preset includes 4 Poisson ranges plus one g=0 control, and
-# uses 1,048,576 train pairs per condition, radius 12 and logical batch 1024.
+# The production_v2 preset includes 4 Poisson ranges plus one g=0 control,
+# 2,097,152 train pairs/condition, radius 15 and logical batch 1024. It uses
+# 500-step warmup plus cosine decay from peak 1e-3 to 1e-5 over 10,000 steps.
+# The all stage saves evaluation arrays and PNGs after the fits finish.
 srun --ntasks=1 "$PYTHON" -u lramb_poisson_range.py all \
-  --preset production \
+  --preset production_v2 \
   --num-gpus 4 \
   --cpu-threads 1 \
   "$@"
