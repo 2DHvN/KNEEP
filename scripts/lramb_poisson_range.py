@@ -33,12 +33,14 @@ from models.lramb_poisson import (
     generate_datasets,
     generate_trajectory_task,
     load_dataset,
+    load_movie_dataset,
     open_video_dataset,
     prepare_generation,
     read_manifest,
 )
 from shell_force import ShellForceKNEEP2D
 from utils.training import TrainingConfig, TrainingResult, train_model
+from utils.video_data import ShardedVideo
 
 
 @dataclass(frozen=True)
@@ -85,10 +87,18 @@ def fit_preset(name: str) -> FitConfig:
             previous.training, lr_scheduler="cosine", lr_warmup_steps=500,
             lr_min=1e-5,
         ))
+    if name == "production_v3":
+        previous = fit_preset("production_v2")
+        return replace(previous, training=replace(
+            previous.training, lr_scheduler="plateau", lr_warmup_steps=0,
+            validate_every=250, lr_plateau_factor=0.5,
+            lr_plateau_patience=3, lr_plateau_threshold=1e-3,
+            lr_plateau_cooldown=1,
+        ))
     if name == "reference":
         return FitConfig(hidden_layers=3, repeats=5,
             training=replace(FitConfig().training, iterations=5_000))
-    raise ValueError("preset must be quick, demo, refined, production, production_v2 or reference")
+    raise ValueError("preset must be quick, demo, refined, production, production_v2, production_v3 or reference")
 
 
 def _device(value: str | torch.device) -> torch.device:
@@ -143,6 +153,11 @@ def _complete_dataset(output_dir: Path) -> dict:
     manifest = read_manifest(output_dir)
     if not manifest.get("complete"):
         raise RuntimeError("dataset generation is incomplete; run the generate stage first")
+    # Early schema-1 manifests stored coupling only in the shared config.
+    for condition in manifest["conditions"]:
+        control = condition.get("is_control", float(condition["ell"]) == 0)
+        condition.setdefault("is_control", control)
+        condition.setdefault("strength", 0.0 if control else manifest["config"]["strength"])
     return manifest
 
 
@@ -166,7 +181,7 @@ def _validate_fit(config: FitConfig, n: int) -> None:
 def _condition_label(condition: dict) -> str:
     if condition.get("is_control") or float(condition["ell"]) == 0:
         return "g=0 (no long-range)"
-    return f"ell={float(condition['ell']):g}"
+    return f"g={float(condition['strength']):g}, ell={float(condition['ell']):g}"
 
 
 def _worker_task(task: dict, device: str, cpu_threads: int):
@@ -280,7 +295,7 @@ def _train_repeat(task: dict, target: torch.device) -> dict:
     config = FitConfig(**{**task["config"],
         "training": TrainingConfig(**task["config"]["training"])})
     folder, condition = Path(task["output_dir"]), task["condition"]
-    ell, repeat = float(condition["ell"]), task["repeat"]
+    cid, repeat = condition["condition_id"], task["repeat"]
     path = Path(task["checkpoint"])
     if path.exists() and not task["force"]:
         if _load_checkpoint(path).get("signature") != task["signature"]:
@@ -288,11 +303,11 @@ def _train_repeat(task: dict, target: torch.device) -> dict:
         return dict(checkpoint=str(path), reused=True)
     data = _complete_dataset(folder)
     if data.get("storage") == "trajectory_shards":
-        train_video = open_video_dataset(folder, ell, "train", cache_size=task["shard_cache_size"])
-        validation_video = open_video_dataset(folder, ell, "validation", cache_size=task["shard_cache_size"])
+        train_video = open_video_dataset(folder, cid, "train", cache_size=task["shard_cache_size"])
+        validation_video = open_video_dataset(folder, cid, "validation", cache_size=task["shard_cache_size"])
     else:
-        train_video = load_dataset(folder, ell, "train")["video"]
-        validation_video = load_dataset(folder, ell, "validation")["video"]
+        train_video = load_dataset(folder, cid, "train")["video"]
+        validation_video = load_dataset(folder, cid, "validation")["video"]
     if task["progress"]:
         print(f"{_condition_label(condition)}, fit seed {repeat}: "
               f"{train_video.shape[0] * (train_video.shape[1] - 1):,} train pairs", flush=True)
@@ -313,7 +328,8 @@ def _train_repeat(task: dict, target: torch.device) -> dict:
         best_learning_rate=result.best_learning_rate,
         history=dict(iterations=list(result.history_iterations),
             train_losses=list(result.train_losses), validation_losses=list(result.validation_losses),
-            learning_rates=list(result.learning_rates)),
+            learning_rates=list(result.learning_rates),
+            next_learning_rates=list(result.next_learning_rates)),
     ))
     return dict(checkpoint=str(path), reused=False)
 
@@ -347,15 +363,15 @@ def train_sweep(output_dir: str | Path, config: FitConfig, *, device="auto",
     _write_json(path, manifest)
     tasks = []
     for condition in data["conditions"]:
-        ell = float(condition["ell"])
+        cid = condition["condition_id"]
         for repeat in range(config.repeats):
-            checkpoint_path = folder / "checkpoints" / condition_id(ell) / f"repeat_{repeat:03d}.pt"
+            checkpoint_path = folder / "checkpoints" / cid / f"repeat_{repeat:03d}.pt"
             if checkpoint_path.exists() and not force:
                 saved = _load_checkpoint(checkpoint_path)
                 if saved.get("signature") != signature:
                     raise ValueError(f"stale checkpoint: {checkpoint_path}; use --force")
                 if progress:
-                    print(f"ell={ell:g}, repeat={repeat + 1}: reusing completed fit", flush=True)
+                    print(f"{_condition_label(condition)}, repeat={repeat + 1}: reusing completed fit", flush=True)
                 continue
             tasks.append(dict(stage="train", output_dir=str(folder.resolve()),
                 config=asdict(config), condition=condition, repeat=repeat,
@@ -381,7 +397,7 @@ def _restore(checkpoint: dict, target: torch.device) -> TrainingResult:
 
 
 @torch.no_grad()
-def _predict(result: TrainingResult, video: torch.Tensor, interval: float,
+def _predict(result: TrainingResult, video: torch.Tensor | ShardedVideo, interval: float,
              batch_size: int, target: torch.device) -> tuple[np.ndarray, np.ndarray]:
     """Stream maps, retaining ordered increments and only time averaged maps.
 
@@ -398,7 +414,7 @@ def _predict(result: TrainingResult, video: torch.Tensor, interval: float,
         stop = min(start + batch_size, members * transitions)
         flat = torch.arange(start, stop)
         ensemble, time = flat // transitions, flat % transitions
-        pair = torch.stack((video[ensemble, time], video[ensemble, time + 1]), dim=1)
+        pair = _fetch_pairs(video, ensemble, time)
         pair = pair.to(target, dtype=torch.float32)
         pair = (pair - result.mean) / result.std
         raw_maps = result.model(pair, return_maps=True).to(device="cpu", dtype=torch.float64)
@@ -408,6 +424,50 @@ def _predict(result: TrainingResult, video: torch.Tensor, interval: float,
     if not np.isfinite(increments).all() or not np.isfinite(maps).all():
         raise FloatingPointError("nonfinite held-out predictions")
     return increments.reshape(members, transitions, branches), maps
+
+
+def _fetch_pairs(video, ensemble, time):
+    if isinstance(video, ShardedVideo):
+        return video.fetch_pairs(ensemble, time)
+    return torch.stack((video[ensemble, time], video[ensemble, time + 1]), dim=1)
+
+
+def _endpoint_fields(video) -> np.ndarray:
+    """Read only the production endpoints, even for large held-out ensembles."""
+    endpoints = []
+    for start in range(0, video.shape[0], 64):
+        ensemble = torch.arange(start, min(start + 64, video.shape[0]))
+        first = _fetch_pairs(video, ensemble, torch.zeros_like(ensemble))[:, 0, 0]
+        last = _fetch_pairs(video, ensemble, torch.full_like(ensemble, video.shape[1] - 2))[:, 1, 0]
+        endpoints.append(torch.stack((first, last), dim=1))
+    return torch.cat(endpoints).numpy()
+
+
+@torch.no_grad()
+def _predict_movie(result, video, movie, interval, batch_size, target, trajectory=0):
+    """Average predicted maps over the exact windows used by the reference."""
+    starts = np.asarray(movie["window_start"], dtype=np.int64)
+    ends = np.asarray(movie["window_end"], dtype=np.int64)
+    transitions = video.shape[1] - 1
+    if (starts.ndim != 1 or starts.shape != ends.shape or not len(starts)
+            or starts[0] != 0 or ends[-1] != transitions
+            or np.any(ends <= starts) or np.any(starts[1:] != ends[:-1])):
+        raise ValueError("movie windows must partition the saved trajectory intervals")
+    height, width = video.shape[-2:]
+    sums = np.zeros((len(starts), height, width), dtype=np.float64)
+    for start in range(0, transitions, batch_size):
+        times = torch.arange(start, min(start + batch_size, transitions))
+        ensemble = torch.full_like(times, trajectory)
+        pair = _fetch_pairs(video, ensemble, times).to(target, dtype=torch.float32)
+        pair = (pair - result.mean) / result.std
+        raw = result.model(pair, return_maps=True).to(device="cpu", dtype=torch.float64)
+        site_increment = raw.sum(dim=1).numpy() / (height * width)
+        window = np.searchsorted(ends, times.numpy(), side="right")
+        np.add.at(sums, window, site_increment)
+    rates = sums / ((ends - starts) * interval)[:, None, None]
+    if not np.isfinite(rates).all():
+        raise FloatingPointError("nonfinite predicted movie maps")
+    return rates
 
 
 def _numpy(value):
@@ -470,6 +530,9 @@ def load_evaluation_records(output_dir: str | Path) -> list[dict]:
                 or float(record["ell"]) != float(condition["ell"])
                 or record.get("condition_id", cid) != cid):
             raise ValueError(f"saved evaluation does not match its manifests: {path}")
+        saved_strength = record.get("strength", provenance.get("dataset", {}).get("strength"))
+        if saved_strength is not None and float(saved_strength) != float(condition["strength"]):
+            raise ValueError(f"saved evaluation has a different coupling strength: {path}")
         predicted = record["predicted_increment"]
         reference = record["reference_increment"]
         shells = record["reference_branch_increment"]
@@ -491,8 +554,12 @@ def _evaluate_condition(task: dict, target: torch.device) -> dict:
     path, signature = Path(task["path"]), task["signature"]
     if path.exists() and not task["force"] and _load_record(path, signature) is not None:
         return dict(path=str(path), signature=signature, reused=True)
-    test = load_dataset(folder, float(condition["ell"]), "test")
+    test = load_dataset(folder, condition["condition_id"], "test", lazy=True, cache_size=2)
     interval = float(data["config"]["dt"] * data["config"]["sample_every"])
+    movie, movie_predictions = None, []
+    movie_trajectory = task.get("movie_trajectory", 0)
+    if data["config"].get("movie_trajectories", 0):
+        movie = load_movie_dataset(folder, condition["condition_id"], trajectory=movie_trajectory)
     increments, maps, histories = [], [], []
     for checkpoint_path in task["checkpoints"]:
         checkpoint = _load_checkpoint(Path(checkpoint_path))
@@ -503,6 +570,9 @@ def _evaluate_condition(task: dict, target: torch.device) -> dict:
         increments.append(increment)
         maps.append(mean_map)
         histories.append(checkpoint["history"])
+        if movie is not None:
+            movie_predictions.append(_predict_movie(result, test["video"], movie, interval,
+                task["batch_size"], target, trajectory=movie_trajectory))
         del result
     record = dict(ell=float(condition["ell"]),
         condition_id=condition["condition_id"], label=_condition_label(condition),
@@ -515,21 +585,40 @@ def _evaluate_condition(task: dict, target: torch.device) -> dict:
         reference_branch_increment=_numpy(test["reference_branch_increment"]),
         kernel_weights=_numpy(test["kernel_weights"]),
         kernel_multiplier=_numpy(test["kernel_multiplier"]),
-        fields=_numpy(test["video"][:, [0, -1], 0]), history=histories,
+        fields=_endpoint_fields(test["video"]), history=histories,
         metadata=dict(dataset=data["config"], fit=training["config"],
             condition=condition, dataset_signature=data["signature"],
             training_signature=training["signature"]), diagnostics=test.get("diagnostics", {}))
+    if movie is not None:
+        record.update(movie_fields=_numpy(movie["fields"]),
+            movie_medium_rate=_numpy(movie["medium_rate_maps"]),
+            movie_predicted_rate=np.stack(movie_predictions),
+            movie_time=_numpy(movie["time"]),
+            movie_field_time=_numpy(movie["field_time"]),
+            movie_window_start=_numpy(movie["window_start"]),
+            movie_window_end=_numpy(movie["window_end"]),
+            movie_trajectory=movie_trajectory)
+        record["metadata"]["movie"] = dict(trajectory=movie_trajectory,
+            units="per-site EP / physical time; sum over sites gives window mean global rate",
+            reference="all solver-step midpoint medium EP, integrated within each window",
+            field_time="window endpoint; EP time is the window midpoint")
+    if isinstance(test["video"], ShardedVideo):
+        test["video"].close()
     _save_record(path, record, signature)
     return dict(path=str(path), signature=signature, reused=False)
 
 
 def evaluate_sweep(output_dir: str | Path, *, device="auto", devices=None,
-                   batch_size=32, cpu_threads=1, progress=True, force=False) -> list[dict]:
+                   batch_size=32, cpu_threads=1, movie_trajectory=0,
+                   progress=True, force=False) -> list[dict]:
     """Evaluate held-out data in independent workers; parent saves the summary."""
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     folder = Path(output_dir)
     data = _complete_dataset(folder)
+    movie_count = data["config"].get("movie_trajectories", 0)
+    if movie_trajectory < 0 or (movie_count and movie_trajectory >= movie_count):
+        raise ValueError("movie_trajectory must select one of the captured test trajectories")
     training = json.loads((folder / "training.json").read_text(encoding="utf-8"))
     if not training.get("complete") or training["dataset_signature"] != data["signature"]:
         raise ValueError("complete matching training is required before evaluation")
@@ -544,10 +633,12 @@ def evaluate_sweep(output_dir: str | Path, *, device="auto", devices=None,
         paths = [folder / "checkpoints" / cid / f"repeat_{repeat:03d}.pt"
                  for repeat in range(training["config"]["repeats"])]
         signature = _hash(dict(data=data["signature"], training=training["signature"],
-                              evaluator=_source_hash(), checkpoints=[_file_hash(p) for p in paths]))
+                              evaluator=_source_hash(), movie_trajectory=movie_trajectory,
+                              checkpoints=[_file_hash(p) for p in paths]))
         tasks.append(dict(stage="evaluate", output_dir=str(folder.resolve()), condition=condition,
             path=str((folder / "evaluation" / f"{cid}.npz").resolve()), signature=signature,
             checkpoints=[str(path.resolve()) for path in paths], batch_size=batch_size,
+            movie_trajectory=movie_trajectory,
             force=force, label=f"evaluate {_condition_label(condition)}"))
     completed = _run_tasks(tasks, targets, cpu_threads=cpu_threads, progress=progress)
     records = [_load_record(Path(item["path"]), item["signature"]) for item in completed]
@@ -564,13 +655,18 @@ def _save_summary(folder: Path, records: list[dict]) -> None:
         predicted_rate = r["predicted_increment"].sum(axis=-1) / r["interval"]
         reference_rate = r["reference_increment"].sum(axis=-1) / r["interval"]
         repeat_means = predicted_rate.mean(axis=(1, 2))
+        medium_mean = float(reference_rate.mean())
         rows.append(dict(condition=r.get("condition_id", condition_id(r["ell"])),
             ell=None if r.get("is_control") else r["ell"],
             strength=r.get("strength", r["metadata"]["dataset"]["strength"]),
             label=r.get("label", f"ell={r['ell']:g}"),
             kneep_mean_rate=float(repeat_means.mean()),
             kneep_training_seed_std=float(repeat_means.std(ddof=0)),
-            medium_mean_rate=float(reference_rate.mean()),
+            medium_mean_rate=medium_mean,
+            kneep_mean_ep_per_step=float(repeat_means.mean() * r["interval"]),
+            medium_mean_ep_per_step=medium_mean * r["interval"],
+            predicted_to_medium_rate=(float(repeat_means.mean() / medium_mean)
+                                      if abs(medium_mean) > 1e-10 else None),
             kneep_temporal_variance=float(predicted_rate.var(axis=-1, ddof=0).mean()),
             medium_temporal_variance=float(reference_rate.var(axis=-1, ddof=0).mean()),
             active_mean_rate=float((r["reference_increment"][..., 2] / r["interval"]).mean())))
@@ -610,45 +706,70 @@ def _execution_devices(args) -> tuple[str, ...]:
     return (str(target),) * count
 
 
-def save_figures(records: list[dict], figure_dir: str | Path, *, show=False) -> None:
-    """Render stored arrays on CPU, saving every diagnostic as a PNG."""
+def save_figures(records: list[dict], figure_dir: str | Path, *, show=False,
+                 window_steps=64) -> None:
+    """Save the overview and one readable report for each coupling strength."""
     import matplotlib
     if not show:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from utils.poisson_range_plots import (
-        plot_cumulative_ep, plot_time_averaged_ep, plot_ep_spectrum,
-        plot_temporal_spectrum, plot_range_response, plot_training_history,
-        plot_kernel_diagnostics, plot_fluctuation_comparison,
+        plot_window_averaged_ep, plot_time_averaged_ep, plot_ep_spectrum,
+        plot_ep_performance, plot_training_history, plot_kernel_diagnostics,
+        plot_fluctuation_comparison, group_records_by_strength,
     )
     folder = Path(figure_dir)
     folder.mkdir(parents=True, exist_ok=True)
-    for name, plot in (
-        ("kernel_diagnostics", plot_kernel_diagnostics),
-        ("training_history", plot_training_history),
-        ("cumulative_ep", plot_cumulative_ep),
-        ("time_averaged_ep", plot_time_averaged_ep),
-        ("fluctuation_comparison", plot_fluctuation_comparison),
-        ("ep_spectrum", plot_ep_spectrum),
-        ("temporal_spectrum", plot_temporal_spectrum),
-        ("range_response", plot_range_response),
-    ):
-        figure = plot(records)
-        path = folder / f"{name}.png"
+
+    def save(figure, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(path, dpi=160, bbox_inches="tight")
         print(f"Figure: {path}", flush=True)
         if not show:
             plt.close(figure)
+
+    save(plot_kernel_diagnostics(records), folder / "kernel_diagnostics.png")
+    save(plot_ep_performance(records), folder / "ep_performance.png")
+    for strength, group in group_records_by_strength(records, include_control=True).items():
+        destination = folder / f"g_{strength:g}"
+        for name, plot in (
+            ("training_history", plot_training_history),
+            ("time_averaged_ep", plot_time_averaged_ep),
+            ("fluctuation_comparison", plot_fluctuation_comparison),
+            ("ep_spectrum", plot_ep_spectrum),
+        ):
+            save(plot(group), destination / f"{name}.png")
+        save(plot_time_averaged_ep(group, log_scale=True), destination / "time_averaged_ep_log.png")
+        save(plot_window_averaged_ep(group, window_steps=window_steps),
+             destination / "window_averaged_ep.png")
     if show:
         plt.show()
+
+
+def export_movies(records, output_dir, *, fps=10, max_frames=64, required=False):
+    """Export selected held-out trajectories from saved evaluation arrays."""
+    available = [record for record in records if "movie_fields" in record]
+    if not available:
+        message = "No cached test movies; generate/evaluate a dataset with --movie-trajectories 1."
+        if required:
+            raise ValueError(message)
+        print(message, flush=True)
+        return []
+    import matplotlib
+    matplotlib.use("Agg")
+    from utils.poisson_range_movies import save_test_movies
+    paths = save_test_movies(available, output_dir, fps=fps, max_frames=max_frames)
+    for path in paths:
+        print(f"Movie: {path}", flush=True)
+    return paths
 
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", nargs="?", default="all",
-                        choices=("all", "generate", "train", "evaluate", "plot"))
-    parser.add_argument("--preset", choices=("quick", "demo", "refined", "production", "production_v2", "reference"),
-                        default="production_v2")
+                        choices=("all", "generate", "train", "evaluate", "plot", "movies"))
+    parser.add_argument("--preset", choices=("quick", "demo", "refined", "production", "production_v2", "production_v3", "reference"),
+                        default="production_v3")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--lramb-root", type=Path)
     placement = parser.add_mutually_exclusive_group()
@@ -658,6 +779,10 @@ def main(argv=None) -> None:
     parser.add_argument("--workers", type=int,
                         help="CPU worker count, or cap the number of allocated GPU workers")
     parser.add_argument("--ells", nargs="+", type=float)
+    parser.add_argument("--strengths", nargs="+", type=float, help="positive g values crossed with every ell")
+    parser.add_argument("--noise", type=float, dest="D", help="conserved noise strength D")
+    parser.add_argument("--mean", type=float, help="conserved mean field; domain_wall requires zero")
+    parser.add_argument("--initial-mode", choices=("stripe", "random", "domain_wall"))
     parser.add_argument("--include-no-interaction", action=argparse.BooleanOptionalAction,
                         default=None, help="include one g=0 no-long-range control")
     parser.add_argument("--iterations", type=int)
@@ -667,9 +792,13 @@ def main(argv=None) -> None:
     parser.add_argument("--train-micro-batch-size", type=int,
                         help="GPU chunk size with exact gradient accumulation within the logical batch")
     parser.add_argument("--learning-rate", type=float)
-    parser.add_argument("--lr-scheduler", choices=("none", "cosine"))
-    parser.add_argument("--lr-min", type=float, help="final learning rate for cosine decay")
-    parser.add_argument("--lr-warmup-steps", type=int, help="linear warmup optimizer updates before cosine decay")
+    parser.add_argument("--lr-scheduler", choices=("none", "cosine", "plateau"))
+    parser.add_argument("--lr-min", type=float, help="minimum learning rate after decay")
+    parser.add_argument("--lr-warmup-steps", type=int, help="optional linear warmup optimizer updates")
+    parser.add_argument("--lr-plateau-factor", type=float)
+    parser.add_argument("--lr-plateau-patience", type=int, help="patience in full validation events")
+    parser.add_argument("--lr-plateau-threshold", type=float, help="absolute validation-loss improvement threshold")
+    parser.add_argument("--lr-plateau-cooldown", type=int, help="cooldown in full validation events")
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--validate-every", type=int)
     parser.add_argument("--sample-every", type=int)
@@ -678,6 +807,9 @@ def main(argv=None) -> None:
     parser.add_argument("--train-trajectories", type=int)
     parser.add_argument("--validation-trajectories", type=int)
     parser.add_argument("--test-trajectories", type=int)
+    parser.add_argument("--movie-trajectories", type=int, help="capture reference maps for the first N test trajectories")
+    parser.add_argument("--movie-window-steps", type=int, help="saved intervals per averaged movie frame")
+    parser.add_argument("--movie-trajectory", type=int, default=0, help="captured test trajectory used during evaluation")
     parser.add_argument("--min-train-pairs", type=int,
                         help="increase train trajectory count to retain at least this many adjacent pairs")
     parser.add_argument("--batch-size", type=int, help="evaluation batch size; uses the fit preset by default")
@@ -688,17 +820,30 @@ def main(argv=None) -> None:
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--figure-dir", type=Path, help="PNG destination for all/plot; default OUTPUT_DIR/figures")
     parser.add_argument("--show", action="store_true", help="also display figures interactively in all/plot")
+    parser.add_argument("--window-steps", type=int, default=64, help="saved intervals per window in EP time plots")
+    parser.add_argument("--no-movies", action="store_true", help="skip movie export after all/plot")
+    parser.add_argument("--movie-fps", type=int, default=10)
+    parser.add_argument("--movie-max-frames", type=int, default=64)
     args = parser.parse_args(argv)
     if args.cpu_threads < 1 or args.shard_cache_size < 1:
         parser.error("--cpu-threads and --shard-cache-size must be positive")
+    if min(args.window_steps, args.movie_fps, args.movie_max_frames) < 1 or args.movie_trajectory < 0:
+        parser.error("window steps, movie FPS and frame limit must be positive; movie trajectory must be nonnegative")
     torch.set_num_threads(args.cpu_threads)
-    default_output = (ROOT / "results" / "lramb_poisson_production_v2_range15"
+    default_output = (ROOT / "results" / "lramb_poisson_production_v3"
+                      if args.preset == "production_v3" else
+                      ROOT / "results" / "lramb_poisson_production_v2_range15"
                       if args.preset == "production_v2"
                       else ROOT / "results" / "lramb_poisson_range" / args.preset)
     output = args.output_dir or default_output
-    if args.stage == "plot":
+    if args.stage in {"plot", "movies"}:
         records = load_evaluation_records(output)
-        save_figures(records, args.figure_dir or output / "figures", show=args.show)
+        if args.stage == "plot":
+            save_figures(records, args.figure_dir or output / "figures", show=args.show,
+                         window_steps=args.window_steps)
+        if args.stage == "movies" or not args.no_movies:
+            export_movies(records, output / "movies", fps=args.movie_fps,
+                          max_frames=args.movie_max_frames, required=args.stage == "movies")
         return
     try:
         devices = _execution_devices(args)
@@ -708,9 +853,12 @@ def main(argv=None) -> None:
     data_overrides = {name: getattr(args, name) for name in (
         "sample_every", "burn_steps", "production_steps", "train_trajectories",
         "validation_trajectories", "test_trajectories", "include_no_interaction",
+        "D", "mean", "initial_mode", "movie_trajectories", "movie_window_steps",
     ) if getattr(args, name) is not None}
     if args.ells is not None:
         data_overrides["ells"] = tuple(args.ells)
+    if args.strengths is not None:
+        data_overrides["strengths"] = tuple(args.strengths)
     data_config = replace(data_config, **data_overrides)
     if args.min_train_pairs is not None:
         if args.min_train_pairs < 1:
@@ -721,6 +869,7 @@ def main(argv=None) -> None:
     optimizer_overrides = {name: getattr(args, name) for name in (
         "iterations", "train_batch_size", "train_micro_batch_size", "learning_rate",
         "weight_decay", "validate_every", "lr_scheduler", "lr_min", "lr_warmup_steps",
+        "lr_plateau_factor", "lr_plateau_patience", "lr_plateau_threshold", "lr_plateau_cooldown",
     ) if getattr(args, name) is not None}
     fit_config = replace(fit_config, training=replace(fit_config.training, **optimizer_overrides),
         **{name: getattr(args, name) for name in ("repeats", "max_distance")
@@ -746,12 +895,17 @@ def main(argv=None) -> None:
         print(f"Training complete: {output}")
     if args.stage in {"all", "evaluate"}:
         records = evaluate_sweep(output, devices=devices, batch_size=prediction_batch,
-            cpu_threads=args.cpu_threads, progress=not args.quiet, force=args.force)
+            cpu_threads=args.cpu_threads, movie_trajectory=args.movie_trajectory,
+            progress=not args.quiet, force=args.force)
         for record in records:
             print(f"{record.get('label', record['ell'])}: predictions {record['predicted_increment'].shape}")
         print(f"Evaluation arrays: {output / 'evaluation'}; open demos/lramb_poisson_range.ipynb for inline plots")
         if args.stage == "all":
-            save_figures(records, args.figure_dir or output / "figures", show=args.show)
+            save_figures(records, args.figure_dir or output / "figures", show=args.show,
+                         window_steps=args.window_steps)
+            if not args.no_movies:
+                export_movies(records, output / "movies", fps=args.movie_fps,
+                              max_frames=args.movie_max_frames)
 
 
 if __name__ == "__main__":

@@ -33,14 +33,18 @@ class TrainingConfig:
     # None retains the historical single forward/backward per optimizer step.
     # Smaller microbatches accumulate the same logical-batch mean gradient.
     train_micro_batch_size: int | None = None
-    # The schedule counts optimizer updates, independently of microbatch size.
+    # Cosine counts optimizer updates; plateau counts full validation events.
     lr_scheduler: str = "none"
     lr_min: float = 1e-5
     lr_warmup_steps: int = 0
+    lr_plateau_factor: float = 0.5
+    lr_plateau_patience: int = 3
+    lr_plateau_threshold: float = 1e-3
+    lr_plateau_cooldown: int = 1
 
     def __post_init__(self) -> None:
-        if self.lr_scheduler not in {"none", "cosine"}:
-            raise ValueError("lr_scheduler must be 'none' or 'cosine'")
+        if self.lr_scheduler not in {"none", "cosine", "plateau"}:
+            raise ValueError("lr_scheduler must be 'none', 'cosine' or 'plateau'")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
             raise ValueError("learning_rate must be finite and positive")
         if not math.isfinite(self.lr_min) or self.lr_min < 0:
@@ -54,6 +58,18 @@ class TrainingConfig:
                 raise ValueError(
                     "lr_warmup_steps must be an integer in [0, iterations)"
                 )
+        if self.lr_scheduler == "plateau":
+            if (not math.isfinite(self.lr_plateau_factor)
+                    or not 0 < self.lr_plateau_factor < 1):
+                raise ValueError("lr_plateau_factor must be finite and in (0, 1)")
+            if (not math.isfinite(self.lr_plateau_threshold)
+                    or self.lr_plateau_threshold < 0):
+                raise ValueError("lr_plateau_threshold must be finite and nonnegative")
+            for name in ("lr_plateau_patience", "lr_plateau_cooldown"):
+                value = getattr(self, name)
+                if (isinstance(value, bool) or not isinstance(value, Integral)
+                        or value < 0):
+                    raise ValueError(f"{name} must be a nonnegative integer")
 
 
 @dataclass
@@ -68,6 +84,9 @@ class TrainingResult:
     validation_losses: tuple[float, ...] = ()
     learning_rates: tuple[float, ...] = ()
     best_learning_rate: float | None = None
+    # Optimizer LR immediately after each recorded validation event. Plateau
+    # reductions are visible here before their use by the following update.
+    next_learning_rates: tuple[float, ...] = ()
 
 
 def _learning_rate_at_iteration(config: TrainingConfig, iteration: int) -> float:
@@ -77,13 +96,17 @@ def _learning_rate_at_iteration(config: TrainingConfig, iteration: int) -> float
     update and reaches ``learning_rate`` on the last warmup update. Cosine
     decay then reaches ``lr_min`` on the final update. Without warmup, the
     first update uses ``learning_rate``; a one-update run uses ``lr_min``.
-    ``lr_min`` is the decay floor, so warmup may start below it.
+    ``lr_min`` is the decay floor, so warmup may start below it. For plateau,
+    this helper supplies only the warmup ramp; after warmup the optimizer
+    retains the LR selected by ReduceLROnPlateau.
     """
     if config.lr_scheduler == "none":
         return config.learning_rate
     warmup = config.lr_warmup_steps
     if iteration <= warmup:
         return config.learning_rate * iteration / warmup
+    if config.lr_scheduler == "plateau":
+        return config.learning_rate
     if warmup:
         phase = (iteration - warmup) / (config.iterations - warmup)
     else:
@@ -181,8 +204,11 @@ def train_model(
     losses are summed and divided by the logical batch size before backward,
     gradients are clipped once, and AdamW takes exactly one step.  The model
     has no batch normalization or dropout, so this preserves the objective.
-    Optional linear warmup and cosine decay advance once per optimizer step;
-    checkpoint learning rates record the rate actually used by that update.
+    Optional linear warmup and cosine decay advance once per optimizer step.
+    Plateau scheduling instead observes each full validation after warmup;
+    its absolute improvement threshold handles the negative alpha loss.
+    Checkpoint learning rates record the rate actually used by that update;
+    next_learning_rates record the optimizer rate after validation.
     """
     if config.train_batch_size <= 0 or config.validation_batch_size <= 0:
         raise ValueError("training and validation batch sizes must be positive")
@@ -217,6 +243,14 @@ def train_model(
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
+    plateau_scheduler = None
+    if config.lr_scheduler == "plateau":
+        plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", threshold_mode="abs",
+            factor=config.lr_plateau_factor, patience=config.lr_plateau_patience,
+            threshold=config.lr_plateau_threshold,
+            cooldown=config.lr_plateau_cooldown, min_lr=config.lr_min,
+        )
 
     if normalization is None:
         mean_cpu, std_cpu = channel_normalization(train_video)
@@ -238,6 +272,7 @@ def train_model(
     train_losses: list[float] = []
     validation_losses: list[float] = []
     learning_rates: list[float] = []
+    next_learning_rates: list[float] = []
 
     iterator = trange(
         1,
@@ -247,9 +282,13 @@ def train_model(
         disable=not progress,
     )
     for iteration in iterator:
-        learning_rate = _learning_rate_at_iteration(config, iteration)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = learning_rate
+        # Once warmup finishes, plateau owns the optimizer LR. Reassigning
+        # the base rate here would silently undo every validation reduction.
+        if plateau_scheduler is None or iteration <= config.lr_warmup_steps:
+            scheduled_rate = _learning_rate_at_iteration(config, iteration)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = scheduled_rate
+        learning_rate = float(optimizer.param_groups[0]["lr"])
         model.train()
         ensemble = torch.randint(
             train_video.shape[0],
@@ -293,6 +332,12 @@ def train_model(
             train_losses.append(float(loss_value.cpu()))
             validation_losses.append(validation_loss)
             learning_rates.append(learning_rate)
+            if (plateau_scheduler is not None
+                    and iteration >= config.lr_warmup_steps):
+                # One observation of the complete validation set, regardless
+                # of the number of optimizer steps or gradient microbatches.
+                plateau_scheduler.step(validation_loss)
+            next_learning_rates.append(float(optimizer.param_groups[0]["lr"]))
             if validation_loss < best_loss:
                 best_loss = validation_loss
                 best_iteration = iteration
@@ -317,6 +362,7 @@ def train_model(
         validation_losses=tuple(validation_losses),
         learning_rates=tuple(learning_rates),
         best_learning_rate=best_learning_rate,
+        next_learning_rates=tuple(next_learning_rates),
     )
 
 

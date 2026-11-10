@@ -13,7 +13,9 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import Normalize, SymLogNorm
 from matplotlib.figure import Figure
+from matplotlib.ticker import FuncFormatter
 
 
 Records = Sequence[Mapping[str, Any]]
@@ -23,17 +25,48 @@ _TRAJECTORY = "#8997a6"
 _COMPONENTS = ("local conservative", "long-range conservative", "active")
 
 
+def condition_strength(record: Mapping[str, Any]) -> float:
+    """Effective coupling, including the single control in legacy archives."""
+    if record.get("is_control") or float(record["ell"]) == 0:
+        return 0.0
+    metadata = record.get("metadata", {})
+    for source in (record, metadata.get("condition", {}), metadata.get("dataset", {})):
+        value = source.get("strength", source.get("g"))
+        if value is not None:
+            value = float(value)
+            if not np.isfinite(value):
+                raise ValueError("condition strength must be finite")
+            return value
+    # Historical single-coupling records used this fixed value.
+    return 0.35
+
+
 def condition_label(record: Mapping[str, Any]) -> str:
     """Distinguish the g=0 control from a physical zero-range kernel."""
-    if record.get("is_control") or float(record["ell"]) == 0:
+    if condition_strength(record) == 0:
         return "g=0 (no long-range)"
-    return rf"$\ell={float(record['ell']):g}$"
+    return rf"$g={condition_strength(record):g},\ \ell={float(record['ell']):g}$"
+
+
+def group_records_by_strength(records: Records, *, include_control: bool = True) -> dict[float, list[Mapping[str, Any]]]:
+    """One report per interacting coupling; reuse the same g=0 control."""
+    ordered = _records(records)
+    controls = [record for record in ordered if condition_strength(record) == 0]
+    strengths = sorted({condition_strength(record) for record in ordered if condition_strength(record) != 0})
+    if not strengths:
+        return {0.0: controls}
+    return {strength: ([*controls] if include_control else []) + [
+        record for record in ordered if condition_strength(record) == strength
+    ] for strength in strengths}
 
 
 def _condition_axis(ax: Any, records: Records) -> None:
     """Use condition ticks so the control is never fitted as a range value."""
     ax.set_xticks(np.arange(len(records)))
-    ax.set_xticklabels([condition_label(record) for record in records], fontsize=8)
+    labels = ["g=0\ncontrol" if condition_strength(record) == 0 else
+              f"g={condition_strength(record):g}\nell={float(record['ell']):g}" for record in records]
+    ax.set_xticklabels(labels, fontsize=8, rotation=35 if len(records) > 6 else 0,
+                       ha="right" if len(records) > 6 else "center")
     ax.set_xlabel("long-range interaction condition")
 
 
@@ -44,7 +77,7 @@ def _array(value: Any) -> np.ndarray:
 
 
 def _records(records: Records) -> list[Mapping[str, Any]]:
-    result = sorted(records, key=lambda record: float(record["ell"]))
+    result = sorted(records, key=lambda record: (condition_strength(record), float(record["ell"])))
     if not result:
         raise ValueError("At least one evaluated interaction range is required.")
     return result
@@ -52,11 +85,23 @@ def _records(records: Records) -> list[Mapping[str, Any]]:
 
 def _condition_colors(records: Records) -> list[Any]:
     """Keep physical ranges on one palette and the g=0 control gray."""
-    interacting = [record for record in records
-                   if not (record.get("is_control") or float(record["ell"]) == 0)]
-    palette = iter(plt.get_cmap("viridis")(np.linspace(0.1, 0.85, len(interacting))))
-    return ["0.45" if record.get("is_control") or float(record["ell"]) == 0
-            else next(palette) for record in records]
+    ells = sorted({float(record["ell"]) for record in records if condition_strength(record) != 0})
+    palette = dict(zip(ells, plt.get_cmap("viridis")(np.linspace(0.1, 0.85, len(ells)))))
+    return ["0.45" if condition_strength(record) == 0 else palette[float(record["ell"])] for record in records]
+
+
+def _condition_linestyles(records: Records) -> list[str]:
+    strengths = sorted({condition_strength(record) for record in records if condition_strength(record) != 0})
+    patterns = ("-", "--", ":", "-.")
+    styles = {strength: patterns[index % len(patterns)] for index, strength in enumerate(strengths)}
+    return [styles.get(condition_strength(record), "-") for record in records]
+
+
+def _signed_norm(limit: float, log_scale: bool) -> Normalize:
+    limit = max(float(limit), 1e-12)
+    if log_scale:
+        return SymLogNorm(linthresh=limit * 1e-3, vmin=-limit, vmax=limit, base=10)
+    return Normalize(vmin=-limit, vmax=limit)
 
 
 def _nonnegative_scale(axes: Sequence[Any], values: Sequence[np.ndarray]) -> None:
@@ -81,7 +126,7 @@ def _increments(record: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, floa
     interval = float(record["interval"])
     if predicted.ndim != 4 or reference.ndim != 3:
         raise ValueError("Expected predictions [seed, trajectory, time, branch] and references [trajectory, time, component].")
-    if predicted.shape[1:3] != reference.shape[:2] or interval <= 0:
+    if predicted.shape[1:3] != reference.shape[:2] or not np.isfinite(interval) or interval <= 0 or predicted.shape[2] < 1:
         raise ValueError("Predictions and references must share trajectories, times, and a positive interval.")
     return predicted, reference, interval
 
@@ -137,8 +182,59 @@ def plot_cumulative_ep(records: Records) -> Figure:
     return fig
 
 
-def plot_time_averaged_ep(records: Records, trajectory: int = 0) -> Figure:
-    """Rate maps for one held-out trajectory; sums equal global mean rates."""
+def plot_window_averaged_ep(records: Records, window_steps: int = 64) -> Figure:
+    """Ordered, nonoverlapping temporal windows, never pooled across trajectories.
+
+    A window contains ``window_steps`` observed intervals (not necessarily
+    solver steps). Its signed increments are summed, then divided by its actual
+    physical duration. A final shorter window is retained with its own duration.
+    Every learned branch/reference component is included before averaging.
+    """
+    if isinstance(window_steps, bool) or not isinstance(window_steps, int) or window_steps < 1:
+        raise ValueError("window_steps must be a positive integer")
+    ordered = _records(records)
+    groups = group_records_by_strength(ordered, include_control=False)
+    controls = [record for record in ordered if condition_strength(record) == 0]
+    if controls and any(strength != 0 for strength in groups):
+        groups = {0.0: controls, **groups}
+    fig, axes = plt.subplots(len(groups), 2, figsize=(13, 3.3 * len(groups)), squeeze=False)
+    for row, (strength, group) in enumerate(groups.items()):
+        member_ids = {id(record) for record in group}
+        for color, linestyle, record in zip(_condition_colors(ordered), _condition_linestyles(ordered), ordered):
+            if id(record) not in member_ids:
+                continue
+            predicted, reference, interval = _increments(record)
+            count = predicted.shape[2]
+            starts = np.arange(0, count, window_steps)
+            ends = np.minimum(starts + window_steps, count)
+            duration = (ends - starts) * interval
+            learned = np.add.reduceat(predicted.sum(-1), starts, axis=2) / duration
+            direct = np.add.reduceat(reference.sum(-1), starts, axis=1) / duration
+            time = (starts + ends) * interval / 2
+            mean = learned.mean((0, 1))
+            seed_sd = _std(learned.mean(1))
+            trajectory_sd = _std(learned.mean(0))
+            axes[row, 0].plot(time, mean, color=color, linestyle=linestyle, label=condition_label(record))
+            axes[row, 0].fill_between(time, mean - trajectory_sd, mean + trajectory_sd, color=color, alpha=0.08)
+            axes[row, 0].fill_between(time, mean - seed_sd, mean + seed_sd, color=color, alpha=0.2)
+            mean, spread = direct.mean(0), _std(direct)
+            axes[row, 1].plot(time, mean, color=color, linestyle=linestyle, label=condition_label(record))
+            axes[row, 1].fill_between(time, mean - spread, mean + spread, color=color, alpha=0.13)
+        group_label = "g=0 (no long-range)" if strength == 0 else f"g={strength:g}"
+        for col, method in enumerate(("KNEEP stationary path estimate", "Direct midpoint medium reference")):
+            axes[row, col].set(title=f"{group_label}: {method}", xlabel="elapsed time (window center)", ylabel="window mean EP / time")
+            axes[row, col].legend(fontsize=8)
+            _style(axes[row, col])
+    fig.suptitle(f"EP rate in consecutive windows of up to {window_steps} observed intervals", fontsize=13)
+    fig.text(0.5, 0.015, "Signed sums include all local, active and nonlocal contributions; no cumulative curves.\n"
+             "Left bands: trajectory SD (faint), fit-seed SD (dark). Right band: trajectory SD. Different entropy gauges; bands are not confidence intervals.",
+             ha="center", fontsize=8)
+    fig.tight_layout(rect=(0, 0.065, 1, 0.97))
+    return fig
+
+
+def plot_time_averaged_ep(records: Records, trajectory: int = 0, *, log_scale: bool = False) -> Figure:
+    """Rate maps; optional signed logarithmic colors preserve negative EP."""
     records = _records(records)
     fig, axes = plt.subplots(len(records), 4, figsize=(15, 3.15 * len(records)), squeeze=False)
     learned_limit, reference_limit, spread_limit, field_limit = 1e-12, 1e-12, 1e-12, 1e-12
@@ -166,8 +262,8 @@ def plot_time_averaged_ep(records: Records, trajectory: int = 0) -> Figure:
         extent = (0, final.shape[-1] * float(record["dx"]), 0, final.shape[-2] * float(record["dx"]))
         images = (
             axes[row, 0].imshow(final, origin="lower", cmap="RdBu_r", vmin=-field_limit, vmax=field_limit, extent=extent),
-            axes[row, 1].imshow(learned, origin="lower", cmap="RdBu_r", vmin=-learned_limit, vmax=learned_limit, extent=extent),
-            axes[row, 2].imshow(medium, origin="lower", cmap="RdBu_r", vmin=-reference_limit, vmax=reference_limit, extent=extent),
+            axes[row, 1].imshow(learned, origin="lower", cmap="RdBu_r", norm=_signed_norm(learned_limit, log_scale), extent=extent),
+            axes[row, 2].imshow(medium, origin="lower", cmap="RdBu_r", norm=_signed_norm(reference_limit, log_scale), extent=extent),
             axes[row, 3].imshow(seed_spread, origin="lower", cmap="magma", vmin=0, vmax=spread_limit, extent=extent),
         )
         titles = (
@@ -178,21 +274,27 @@ def plot_time_averaged_ep(records: Records, trajectory: int = 0) -> Figure:
         )
         for col, (image, title) in enumerate(zip(images, titles)):
             axes[row, col].set(title=title, xlabel="x", ylabel="y")
-            fig.colorbar(image, ax=axes[row, col], shrink=0.78, label="field" if col == 0 else "EP / time / site")
-    fig.suptitle(f"Time-averaged maps, trajectory {trajectory}; color scales differ between gauges, fixed across ell", fontsize=12)
+            colorbar = fig.colorbar(image, ax=axes[row, col], shrink=0.78, label="field" if col == 0 else "EP / time / site")
+            if log_scale and col in (1, 2):
+                limit = float(image.norm.vmax)
+                colorbar.set_ticks(np.asarray([-1, -.01, 0, .01, 1]) * limit)
+                colorbar.formatter = FuncFormatter(lambda value, _: "0" if value == 0 else f"{value:.0e}")
+                colorbar.update_ticks()
+    scale = "signed logarithmic EP colors" if log_scale else "linear EP colors"
+    fig.suptitle(f"Time-averaged maps, trajectory {trajectory}; {scale}\nColor scales differ between gauges, fixed across conditions", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     return fig
 
 
 def plot_ep_spectrum(records: Records) -> Figure:
-    """Signed shell contributions, temporal variation, and shell cumulants.
+    """Signed mean and temporal variance by shell, without cumulative panels.
 
     The learned branches form a coordinate-dependent decomposition.  Physical
     shells in the reference partition the actual Poisson kernel and are not
     branch-wise training targets.  Variances here are per-shell, not additive.
     """
     records = _records(records)
-    fig, axes = plt.subplots(len(records), 3, figsize=(15, 3.15 * len(records)), squeeze=False)
+    fig, axes = plt.subplots(len(records), 2, figsize=(11, 3.15 * len(records)), squeeze=False)
     for row, record in enumerate(records):
         prediction, _, interval = _increments(record)
         rate = prediction / interval
@@ -218,13 +320,6 @@ def plot_ep_spectrum(records: Records) -> Figure:
         ax.plot(ref_radius, reference_variance, ".--", color=_REFERENCE, label="physical reference shells")
         ax.set(title="Temporal variance by shell", ylabel="Var(EP / time)")
         ax.set_yscale("symlog", linthresh=1e-8)
-        ax = axes[row, 2]
-        cumulative = seed_means.cumsum(-1)
-        cumulative_mean, cumulative_spread = cumulative.mean(0), _std(cumulative)
-        ax.plot(radius, cumulative_mean, "o-", color=_LEARNED, label="KNEEP shells <= radius")
-        ax.fill_between(radius, cumulative_mean - cumulative_spread, cumulative_mean + cumulative_spread, color=_LEARNED, alpha=0.2, label="fit-seed SD")
-        ax.plot(ref_radius, reference_mean.cumsum(), ".--", color=_REFERENCE, label="physical shells <= radius")
-        ax.set(title="Signed cumulative shell rate", ylabel="EP / time")
         for ax in axes[row]:
             ax.set_xlabel("Chebyshev shell radius (physical length)")
             _style(ax)
@@ -239,8 +334,7 @@ def plot_fluctuation_comparison(records: Records) -> Figure:
     """Overlay interaction ranges, with learned and direct gauges in two rows.
 
     Rates are saved increments divided by the physical observation interval.
-    All panels omit radius zero. The last column sums SIGNED nonlocal shell
-    rates before taking the temporal variance, retaining their covariances.
+    Both columns omit radius zero and show individual-shell fluctuations.
     Variance is computed within each trajectory (ddof=0), then averaged over
     trajectories and, for KNEEP, fit seeds. Bands are descriptive standard
     deviations across fit seeds (top) or trajectories (bottom), not CIs.
@@ -251,12 +345,11 @@ def plot_fluctuation_comparison(records: Records) -> Figure:
     """
     records = _records(records)
     colors = _condition_colors(records)
-    fig, axes = plt.subplots(2, 3, figsize=(15.5, 8), sharex="col", sharey="col")
-    maxima: list[list[np.ndarray]] = [[], [], []]
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.5), sharex="col", sharey="col")
+    maxima: list[list[np.ndarray]] = [[], []]
     titles = (r"Shell variance: $\mathrm{Var}_t(j_\rho)$",
-              r"Distance scaling: $\mathrm{Var}_t(j_\rho)/\rho^2$",
-              r"Cumulative variance: $\mathrm{Var}_t(\sum_{0<\rho\leq R}j_\rho)$")
-    for color, record in zip(colors, records):
+              r"Distance scaling: $\mathrm{Var}_t(j_\rho)/\rho^2$")
+    for color, linestyle, record in zip(colors, _condition_linestyles(records), records):
         predicted, _, interval = _increments(record)
         direct = _array(record["reference_branch_increment"])
         if direct.ndim != 3 or direct.shape[:2] != predicted.shape[1:3]:
@@ -270,28 +363,25 @@ def plot_fluctuation_comparison(records: Records) -> Figure:
         # Keep independent trajectories separate, and retain fit-seed variation.
         learned_shell = np.var(learned_rate, axis=2, ddof=0).mean(axis=1)
         direct_shell = np.var(direct_rate, axis=1, ddof=0)
-        learned_cumulative = np.var(np.cumsum(learned_rate, axis=-1), axis=2, ddof=0).mean(axis=1)
-        direct_cumulative = np.var(np.cumsum(direct_rate, axis=-1), axis=1, ddof=0)
         statistics = (
-            (learned_shell, learned_shell / radii[0] ** 2, learned_cumulative),
-            (direct_shell, direct_shell / radii[1] ** 2, direct_cumulative),
+            (learned_shell, learned_shell / radii[0] ** 2),
+            (direct_shell, direct_shell / radii[1] ** 2),
         )
         for row in range(2):
             for col, samples in enumerate(statistics[row]):
                 mean, spread = samples.mean(axis=0), _std(samples, axis=0)
-                axes[row, col].plot(radii[row], mean, "o-", markersize=3,
-                                    color=color, label=condition_label(record))
+                axes[row, col].plot(radii[row], mean, marker="o", markersize=3,
+                                    color=color, linestyle=linestyle, label=condition_label(record))
                 lower, upper = np.maximum(mean - spread, 0), mean + spread
                 axes[row, col].fill_between(radii[row], lower, upper,
                                            color=color, alpha=0.13)
                 maxima[col].append(upper)
-    for col in range(3):
+    for col in range(2):
         _nonnegative_scale(axes[:, col], maxima[col])
         for row in range(2):
             method = "KNEEP" if row == 0 else "Direct medium reference"
             axes[row, col].set_title(f"{method}\n{titles[col]}", fontsize=11)
-            axes[row, col].set_xlabel("Chebyshev radius R (physical length)" if col == 2
-                                      else "Chebyshev shell radius rho (physical length)")
+            axes[row, col].set_xlabel("Chebyshev shell radius rho (physical length)")
             axes[row, col].set_ylabel("Var(EP / time) / length squared" if col == 1
                                       else "Var(EP / time)")
             axes[row, col].set_xlim(left=0)
@@ -302,13 +392,14 @@ def plot_fluctuation_comparison(records: Records) -> Figure:
                     transform=axes[1, 0].transAxes, ha="right", va="top", fontsize=8)
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.955),
-               ncol=min(len(records), 5), fontsize=9)
+               ncol=min(len(records), 4), fontsize=8)
     fig.suptitle("Interaction-range dependence of nonlocal shell fluctuations", y=0.995, fontsize=14)
     fig.text(0.5, 0.025,
-             "All panels omit rho=0; cumulative sums contain only 0<rho<=R. Rates use increment / saved interval, with no further rescaling.\n"
+             "All panels omit rho=0. Color identifies ell; line style identifies g. Rates use increment / saved interval.\n"
              "The two decompositions have different gauges. Direct midpoint medium EP is not exact stationary total EP; shared symlog scales retain zeros.",
              ha="center", va="bottom", fontsize=8.5)
-    fig.tight_layout(rect=(0, 0.075, 1, 0.91))
+    legend_top = 0.91 if len(records) <= 5 else 0.82
+    fig.tight_layout(rect=(0, 0.075, 1, legend_top))
     return fig
 
 
@@ -336,7 +427,7 @@ def plot_temporal_spectrum(records: Records) -> Figure:
     fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex="col", sharey="col")
     colors = _condition_colors(records)
     psd_limits, variance_limits = [], []
-    for index, (color, record) in enumerate(zip(colors, records)):
+    for index, (color, linestyle, record) in enumerate(zip(colors, _condition_linestyles(records), records)):
         prediction, reference, interval = _increments(record)
         total_rate = prediction.sum(-1) / interval
         direct_rate = reference.sum(-1) / interval
@@ -348,7 +439,7 @@ def plot_temporal_spectrum(records: Records) -> Figure:
         for row, (samples, frequencies) in enumerate(summaries):
             mean, spread = samples.mean(axis=0), _std(samples, axis=0)
             selected = slice(1, None)  # DC is zero after per-trajectory demeaning.
-            axes[row, 0].plot(frequencies[selected], mean[selected], color=color,
+            axes[row, 0].plot(frequencies[selected], mean[selected], color=color, linestyle=linestyle,
                               linewidth=1.1, label=condition_label(record))
             lower, upper = np.maximum(mean - spread, 0), mean + spread
             axes[row, 0].fill_between(frequencies[selected], lower[selected], upper[selected],
@@ -405,54 +496,71 @@ def _kernel_shells(weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.arange(n // 2 + 1), np.bincount(shell.ravel(), weights=weights.ravel(), minlength=n // 2 + 1)
 
 
-def plot_range_response(records: Records) -> Figure:
-    """Summary of range manipulation and learned response, without trend assumptions."""
+def plot_ep_performance(records: Records, *, reference_atol: float = 1e-10) -> Figure:
+    """Mean EP per observed transition and the ratio to direct medium EP.
+
+    Ratios are ratios of ensemble mean rates, not averages of instantaneous
+    ratios. Near-zero denominators are omitted and listed, never regularized
+    by an epsilon. Error bars are descriptive fit-seed and paired-trajectory
+    SDs; the medium gauge is not an exact stationary path-entropy target.
+    """
+    if not np.isfinite(reference_atol) or reference_atol < 0:
+        raise ValueError("reference_atol must be finite and nonnegative")
     records = _records(records)
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
-    colors = _condition_colors(records)
-    ells, mean_rates, seed_sd, trajectory_sd, medium_rates = [], [], [], [], []
-    for color, record in zip(colors, records):
-        prediction, reference, interval = _increments(record)
-        rate = prediction.sum(-1).mean(-1) / interval
-        ell = float(record["ell"])
-        ells.append(ell)
-        mean_rates.append(rate.mean())
-        seed_sd.append(_std(rate.mean(1)))
-        trajectory_sd.append(_std(rate.mean(0)))
-        medium_rates.append(reference.sum(-1).mean() / interval)
-        # K(0)=0 in LRAMB: actual real-space weights are signed and sum to
-        # zero. Sum absolute *site* weights before grouping into shells.
-        shells, absolute_mass = _kernel_shells(np.abs(_array(record["kernel_weights"])))
-        total_mass = absolute_mass.sum()
-        # A zero kernel has no normalized mass distribution. Do not draw a
-        # fabricated zero tail for the no-long-range control.
-        if total_mass > 0:
-            tail = (total_mass - absolute_mass.cumsum()) / total_mass
-            axes[1].plot(shells * float(record["dx"]), np.maximum(tail, 0), "o-", markersize=3, color=color, label=condition_label(record))
-        signed_means = prediction.mean((1, 2)) / interval
-        absolute_means = np.abs(signed_means)
-        totals = absolute_means.sum(-1, keepdims=True)
-        learned_tail = 1 - np.cumsum(absolute_means, axis=-1) / np.maximum(totals, 1e-30)
-        learned_radius = np.arange(learned_tail.shape[-1]) * float(record["dx"])
-        axes[2].plot(learned_radius, learned_tail.mean(0), "o-", markersize=3, color=color, label=condition_label(record))
-        axes[2].fill_between(learned_radius, learned_tail.mean(0) - _std(learned_tail), learned_tail.mean(0) + _std(learned_tail), color=color, alpha=0.13)
-    positions = np.arange(len(records))
-    axes[0].errorbar(positions, mean_rates, yerr=trajectory_sd, fmt="o", color=_TRAJECTORY, capsize=5, label="independent trajectory SD")
-    axes[0].errorbar(positions, mean_rates, yerr=seed_sd, fmt="o", color=_LEARNED, capsize=2, label="KNEEP mean +/- fit-seed SD")
-    axes[0].plot(positions, medium_rates, "s", color=_REFERENCE, label="medium reference")
-    axes[0].set(ylabel="global mean EP / time", title="Does KNEEP respond to the range intervention?")
-    _condition_axis(axes[0], records)
-    axes[0].legend(fontsize=8)
-    axes[1].set(xlabel="Chebyshev radius (physical length)", ylabel="fraction of sum |actual signed kernel weights| beyond radius", title="Actual Poisson kernel absolute-weight tail", ylim=(-0.04, 1.04))
-    if any(float(record["ell"]) == 0 for record in records):
-        axes[1].text(0.03, 0.03, "g=0: zero kernel, normalized tail undefined", transform=axes[1].transAxes, fontsize=8)
-    axes[2].set(xlabel="learned branch radius (physical length)", ylabel="absolute signed-mean contribution fraction beyond radius", title="Learned shell response; band = fit-seed SD", ylim=(-0.04, 1.04))
+    fig, axes = plt.subplots(1, 2, figsize=(max(12, len(records) * 0.95), 5.5))
+    omitted, intervals, omitted_pairs = [], [], 0
+    first_ratio = True
+    for index, (record, color) in enumerate(zip(records, _condition_colors(records))):
+        predicted, reference, interval = _increments(record)
+        intervals.append(interval)
+        learned = predicted.sum(-1).mean(-1)  # [fit, trajectory], EP / observed step
+        direct = reference.sum(-1).mean(-1)  # [trajectory]
+        learned_mean, direct_mean = float(learned.mean()), float(direct.mean())
+        fit_sd = float(_std(learned.mean(1)))
+        trajectory_sd = float(_std(learned.mean(0)))
+        axes[0].errorbar(index - 0.11, learned_mean, yerr=trajectory_sd, fmt="none", color=_TRAJECTORY, capsize=6,
+                        label="KNEEP trajectory SD" if index == 0 else None)
+        axes[0].errorbar(index - 0.11, learned_mean, yerr=fit_sd, fmt="o", color=color, capsize=3,
+                        label="KNEEP mean; fit-seed SD" if index == 0 else None)
+        axes[0].errorbar(index + 0.11, direct_mean, yerr=float(_std(direct)), fmt="s", color=_REFERENCE, capsize=3,
+                        label="direct medium; trajectory SD" if index == 0 else None)
+        direct_rates = direct / interval
+        denominator = float(direct_rates.mean())
+        if abs(denominator) <= reference_atol:
+            omitted.append(condition_label(record))
+            continue
+        ratio = (learned_mean / interval) / denominator
+        fit_ratios = learned.mean(1) / interval / denominator
+        valid = np.abs(direct_rates) > reference_atol
+        omitted_pairs += int((~valid).sum())
+        paired_ratios = learned.mean(0)[valid] / interval / direct_rates[valid]
+        paired_sd = float(_std(paired_ratios)) if paired_ratios.size else 0.0
+        axes[1].errorbar(index, ratio, yerr=paired_sd, fmt="none", color=_TRAJECTORY, capsize=6,
+                        label="paired-trajectory ratio SD" if first_ratio else None)
+        axes[1].errorbar(index, ratio, yerr=float(_std(fit_ratios)), fmt="o", color=color, capsize=3,
+                        label="ratio of means; fit-seed SD" if first_ratio else None)
+        first_ratio = False
+    axes[0].set(title="Mean total-field EP per observed step", ylabel="total-field EP / observed transition")
+    axes[1].set(title="KNEEP / direct-medium mean EP rate", ylabel="ratio of ensemble mean rates")
+    axes[1].axhline(1, color="black", linestyle="--", linewidth=1, label="unity")
     for ax in axes:
-        _style(ax)
-    for ax in axes[1:]:
+        _condition_axis(ax, records)
         ax.legend(fontsize=8)
-    fig.tight_layout()
+        _style(ax)
+    cadence = f"Observed-step duration = {intervals[0]:g}" if len(set(intervals)) == 1 else "Observed-step duration varies between conditions; use each saved interval."
+    note = f"{cadence}. Signed sums include all branches/components. Error bars are descriptive SDs, not CIs.\nThe direct midpoint medium reference and stationary learned estimate have different finite-time gauges."
+    if omitted:
+        note += "\nUndefined near-zero-reference ratios omitted: " + "; ".join(omitted)
+    if omitted_pairs:
+        note += f"\nPaired-trajectory ratio SD excludes {omitted_pairs} near-zero-reference trajectories."
+    fig.text(0.5, 0.015, note, ha="center", fontsize=8)
+    fig.tight_layout(rect=(0, 0.15 if omitted or omitted_pairs else 0.1, 1, 1))
     return fig
+
+
+def plot_range_response(records: Records) -> Figure:
+    """Compatibility alias for the two-panel EP performance comparison."""
+    return plot_ep_performance(records)
 
 
 def plot_training_history(records: Records) -> Figure:
@@ -505,32 +613,49 @@ def plot_training_history(records: Records) -> Figure:
 
 
 def plot_kernel_diagnostics(records: Records) -> Figure:
-    """The kernel actually used by the simulator, with FFT and shell views."""
+    """Horizontal real-space kernels, with one row per effective coupling.
+
+    Images show ``g * K_ell`` on one shared signed color scale. Archived
+    ``kernel_weights`` are unit-coupling convolution weights, so the explicit
+    strength factor is required. The g=0 control appears exactly once.
+    """
     records = _records(records)
-    fig, axes = plt.subplots(len(records), 3, figsize=(13, 3.2 * len(records)), squeeze=False)
-    for row, record in enumerate(records):
-        weights = _array(record["kernel_weights"])
-        multiplier = _array(record["kernel_multiplier"])
-        dx, ell = float(record["dx"]), float(record["ell"])
-        n = weights.shape[-1]
-        half = n * dx / 2
-        limit = float(np.max(np.abs(weights))) or 1.0
-        image = axes[row, 0].imshow(np.fft.fftshift(weights), origin="lower", cmap="RdBu_r", vmin=-limit, vmax=limit, extent=(-half, half, -half, half))
-        axes[row, 0].set(title=f"{condition_label(record)}: actual kernel weights", xlabel="periodic x offset", ylabel="periodic y offset")
-        fig.colorbar(image, ax=axes[row, 0], shrink=0.8)
-        radius, mass = _kernel_shells(weights)
-        axes[row, 1].plot(radius * dx, mass, "o-", label="signed shell mass")
-        axes[row, 1].plot(radius * dx, mass.cumsum(), ".--", label="cumulative signed mass")
-        axes[row, 1].set(title=f"mass sum={weights.sum():.6g}", xlabel="Chebyshev radius (physical length)", ylabel="kernel weight")
-        axes[row, 1].legend(fontsize=8)
-        wavevector = 2 * np.pi * np.fft.fftfreq(n, d=dx)
-        q = 2 * np.abs(np.sin(wavevector * dx / 2)) / dx
-        # Axial modes make no radial binning approximation.
-        positive = np.arange(n // 2 + 1)
-        axes[row, 2].plot(q[positive], multiplier[0, positive], "o-", markersize=3, label="simulator multiplier, qy=0")
-        axes[row, 2].set(title="Poisson Fourier attenuation; K(0)=0", xlabel="lattice |qx| (1 / length)", ylabel="kernel Fourier multiplier")
-        axes[row, 2].legend(fontsize=8)
-        for ax in axes[row, 1:]:
-            _style(ax)
-    fig.tight_layout()
+    strengths = sorted({condition_strength(record) for record in records if condition_strength(record) != 0})
+    ells = sorted({float(record["ell"]) for record in records if condition_strength(record) != 0})
+    controls = [record for record in records if condition_strength(record) == 0]
+    rows, columns = max(len(strengths), 1), max(len(ells) + bool(controls), 1)
+    fig, axes = plt.subplots(rows, columns, figsize=(3.2 * columns, 3.2 * rows), squeeze=False)
+    effective = {id(record): _array(record.get("effective_kernel_weights",
+                 condition_strength(record) * _array(record["kernel_weights"]))) for record in records}
+    limit = max((float(np.max(np.abs(weights))) for weights in effective.values()), default=0.0) or 1.0
+    cells = {}
+    for record in records:
+        strength = condition_strength(record)
+        if strength != 0:
+            cells[(strengths.index(strength), ells.index(float(record["ell"])))] = record
+    if controls:
+        cells[(0, columns - 1)] = controls[0]
+    shown = []
+    image = None
+    for row in range(rows):
+        for col in range(columns):
+            ax = axes[row, col]
+            record = cells.get((row, col))
+            if record is None:
+                ax.set_visible(False)
+                continue
+            weights = effective[id(record)]
+            dx = float(record["dx"])
+            n = weights.shape[-1]
+            half = n * dx / 2
+            image = ax.imshow(np.fft.fftshift(weights), origin="lower", cmap="RdBu_r",
+                              vmin=-limit, vmax=limit,
+                              extent=(-half - dx / 2, half - dx / 2,
+                                      -half - dx / 2, half - dx / 2))
+            ax.set(title=condition_label(record), xlabel="periodic x offset", ylabel="periodic y offset")
+            shown.append(ax)
+    fig.suptitle("Effective conservative kernels in real space: g K_ell", fontsize=13)
+    fig.subplots_adjust(left=0.055, right=0.9, bottom=0.08, top=0.9, hspace=0.4, wspace=0.3)
+    if image is not None:
+        fig.colorbar(image, ax=shown, shrink=0.8, label="effective signed convolution weight g K_ell")
     return fig
