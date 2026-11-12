@@ -31,6 +31,24 @@ generation, training, evaluation and inline plotting cells. Generation uses the
 sibling `../LRAMB` solver with Euler-Maruyama integration and **every-step
 midpoint medium EP**. Training observes field pairs, never EP reference labels.
 
+For one-condition, one-fit debugging, open
+[demos/lramb_single_run.ipynb](demos/lramb_single_run.ipynb). It contains editable
+simulation, model, training and matplotlib cells: a burn-in/production profile
+movie and steady diagnostics, live raw/EMA losses, cumulative/window EP,
+time-averaged medium versus predicted maps, and separate mean/fluctuation
+predicted shell spectra. It follows the selected architecture in
+`CNEEP_v2/notebooks/Corr_AMB2D_ShellForce.ipynb`: width 64, depth 3, radius 3,
+ELU, absolute shell inputs without nonlocal biases, AdamW lr=1e-3 / wd=0,
+logical batch 2048, 5000 updates, one fit seed (3). Microbatch 128 limits GPU
+activation memory. There are no plotting/training utility wrappers in its cells.
+The physical defaults are the LRAMB domain-wall case, 64x64, D=0.1,
+Poisson g=1 and ell=8. Its train/validation/test ensembles are 102/26/1,
+with 1000/1000/5000 production transitions and disjoint noise streams derived
+from one master seed. Data and checkpoints are cached under
+`results/lramb_single_run/`. The sibling LRAMB package is required; CNEEP_v2
+is a design reference, not a runtime import. This notebook has not been executed
+as part of its creation.
+
 The default `production_v3` compares **13 conditions**:
 `g=(0.5,1,2) x ell=(1,2,4,8)` plus one `g=0` control. The Poisson multiplier is
 `Khat(q)=exp(-ell*q)` for nonzero q and `Khat(0)=0`. The control retains local
