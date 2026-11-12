@@ -739,7 +739,7 @@ def save_figures(records: list[dict], figure_dir: str | Path, *, show=False,
             ("ep_spectrum", plot_ep_spectrum),
         ):
             save(plot(group), destination / f"{name}.png")
-        save(plot_time_averaged_ep(group, log_scale=True), destination / "time_averaged_ep_log.png")
+        save(plot_ep_spectrum(group, log_scale=True), destination / "ep_spectrum_log.png")
         save(plot_window_averaged_ep(group, window_steps=window_steps),
              destination / "window_averaged_ep.png")
     if show:
@@ -803,6 +803,8 @@ def main(argv=None) -> None:
     parser.add_argument("--validate-every", type=int)
     parser.add_argument("--sample-every", type=int)
     parser.add_argument("--burn-steps", type=int)
+    parser.add_argument("--cuda-graph-steps", type=int,
+                        help="opt-in CUDA graph burn-in chunk (1..100, suggest 64); 0 uses eager execution")
     parser.add_argument("--production-steps", type=int)
     parser.add_argument("--train-trajectories", type=int)
     parser.add_argument("--validation-trajectories", type=int)
@@ -854,6 +856,7 @@ def main(argv=None) -> None:
         "sample_every", "burn_steps", "production_steps", "train_trajectories",
         "validation_trajectories", "test_trajectories", "include_no_interaction",
         "D", "mean", "initial_mode", "movie_trajectories", "movie_window_steps",
+        "cuda_graph_steps",
     ) if getattr(args, name) is not None}
     if args.ells is not None:
         data_overrides["ells"] = tuple(args.ells)
@@ -883,6 +886,9 @@ def main(argv=None) -> None:
           f"logical batch={fit_config.training.train_batch_size}, "
           f"microbatch={fit_config.training.train_micro_batch_size}, "
           f"radius={fit_config.max_distance}, iterations={fit_config.training.iterations}")
+    if args.stage in {"all", "generate"}:
+        print(f"Generation CUDA graph chunk: {data_config.cuda_graph_steps} "
+              "(0=eager); saved frames transferred in chunks of up to 64")
     print(f"LR: {fit_config.training.lr_scheduler}; initial={fit_config.training.learning_rate:g}, "
           f"warmup={fit_config.training.lr_warmup_steps}, minimum={fit_config.training.lr_min:g}")
     if args.stage in {"all", "generate"}:

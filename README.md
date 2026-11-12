@@ -144,9 +144,12 @@ overlaid directly. Main figures include:
 - Full-validation learning curves and recorded LR changes.
 - EP rates in consecutive windows (`--window-steps 64`).
 - Mean EP per observed step and KNEEP/direct-medium mean-rate ratio.
-- Signed shell means and temporal variances (two columns).
+- Signed shell means and temporal variances (two columns): `ep_spectrum.png`
+  uses linear mean EP; `ep_spectrum_log.png` uses signed logarithmic mean EP.
+  Symlog retains negative/zero EP with a linear region within +/-1e-8;
+  the radius axis stays linear including rho=0. Variance uses symlog in both.
 - Overlaid Var(j_rho) and Var(j_rho)/rho^2 in separate method rows.
-- Time-averaged EP maps with linear and signed logarithmic (symlog) colors.
+- Time-averaged EP maps with linear colors.
 
 The fluctuation figure excludes rho=0 and cumulative shell sums. Temporal
 variance is calculated within each trajectory. KNEEP bands show fit-seed SD
@@ -184,6 +187,37 @@ CUDA, training movies or checkpoints.
 Generation, condition/fit-seed training and condition evaluation run in parallel.
 Each fit uses one GPU; VRAM is not combined. Use `--workers` to cap concurrency
 or `--device cpu --workers 4` for CPU workers.
+
+For small-grid generation, the CPU can spend most of its time launching tiny
+CUDA kernels. An optional burn-in graph runs up to 100 full Euler-Maruyama steps
+per replay (64 suggested), reusing the graph across trajectories in each worker:
+
+```bash
+# From the KNEEP directory, inside an activated Python environment / tmux:
+python -u scripts/lramb_poisson_range.py all --preset production_v3 \
+  --num-gpus 2 --cpu-threads 1 --cuda-graph-steps 64 \
+  --output-dir results/lramb_poisson_production_v3_graph64 \
+  2>&1 | tee production_v3_graph64.log
+```
+
+The option defaults to 0 (eager), requires CUDA graph support including custom
+generator registration, and is included in dataset provenance. Every burn-in
+step still computes its own noise, drift and canonical FFT. The custom generator
+advances on every replay; warmup does not consume the trajectory RNG stream.
+Production retains every-step midpoint EP. Saved fields are staged in a bounded
+64-frame device buffer before copying to CPU. Each generated trajectory reports
+elapsed seconds and steps/s, including reference checks and writing the shard;
+the first trajectory on each worker also includes graph warmup/capture overhead.
+Compare subsequent timings rather than GPU utilization alone.
+
+The graph path has not been executed or benchmarked on CUDA in the development
+environment. Capture errors propagate; restart with `--cuda-graph-steps 0` in a
+separate output directory if the installed CUDA/PyTorch stack cannot capture it.
+Generator source changes invalidate older generation signatures. Use a new
+output directory for this revision; keep existing shards rather than using
+`--force` on a running/previous dataset. Existing completed datasets remain
+loadable for training/evaluation. Do not launch old and new generators into the
+same output directory.
 
 Trajectory shards use `torch.load(..., mmap=True)` and pairs are fetched without
 copying the full dataset to RAM/GPU. V3 float32 field movies occupy about

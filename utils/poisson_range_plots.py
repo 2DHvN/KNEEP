@@ -286,13 +286,19 @@ def plot_time_averaged_ep(records: Records, trajectory: int = 0, *, log_scale: b
     return fig
 
 
-def plot_ep_spectrum(records: Records) -> Figure:
+def plot_ep_spectrum(records: Records, *, log_scale: bool = False,
+                     linthresh: float = 1e-8) -> Figure:
     """Signed mean and temporal variance by shell, without cumulative panels.
 
     The learned branches form a coordinate-dependent decomposition.  Physical
     shells in the reference partition the actual Poisson kernel and are not
     branch-wise training targets.  Variances here are per-shell, not additive.
+    log_scale selects a signed logarithmic y axis for the mean shell rate;
+    radius stays linear, retaining the local rho=0 bin. Variance always uses
+    symlog to retain exact zeros. linthresh is in the respective y-axis units.
     """
+    if not np.isfinite(linthresh) or linthresh <= 0:
+        raise ValueError("linthresh must be finite and positive")
     records = _records(records)
     fig, axes = plt.subplots(len(records), 2, figsize=(11, 3.15 * len(records)), squeeze=False)
     for row, record in enumerate(records):
@@ -311,6 +317,10 @@ def plot_ep_spectrum(records: Records) -> Figure:
         ax.plot(ref_radius, reference_mean, ".--", color=_REFERENCE, label="physical reference shells")
         ax.set_title(f"{condition_label(record)}: signed mean shell rate")
         ax.set_ylabel("EP / time")
+        if log_scale:
+            ax.set_yscale("symlog", linthresh=linthresh)
+            ax.axhline(0, color="0.6", linewidth=0.6)
+            ax.set_ylabel("EP / time (symlog)")
         variance = np.var(rate, axis=2).mean(1)
         reference_variance = np.var(reference, axis=1).mean(0)
         ax = axes[row, 1]
@@ -319,13 +329,15 @@ def plot_ep_spectrum(records: Records) -> Figure:
         ax.fill_between(radius, np.maximum(variance_mean - variance_spread, 0), variance_mean + variance_spread, color=_LEARNED, alpha=0.2, label="fit-seed SD")
         ax.plot(ref_radius, reference_variance, ".--", color=_REFERENCE, label="physical reference shells")
         ax.set(title="Temporal variance by shell", ylabel="Var(EP / time)")
-        ax.set_yscale("symlog", linthresh=1e-8)
+        ax.set_yscale("symlog", linthresh=linthresh)
         for ax in axes[row]:
             ax.set_xlabel("Chebyshev shell radius (physical length)")
             _style(ax)
             if row == 0:
                 ax.legend(fontsize=7, loc="best")
-    fig.suptitle("EP shell spectra: learned branches and physical shells have different gauges", fontsize=13)
+    scale = f"symlog mean (linear within +/-{linthresh:g})" if log_scale else "linear mean"
+    fig.suptitle(f"EP shell spectra: {scale}; symlog variance\n"
+                 "Learned branches and physical shells have different gauges", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     return fig
 

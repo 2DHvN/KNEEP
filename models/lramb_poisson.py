@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from typing import Any
 
 import numpy as np
@@ -23,7 +24,7 @@ import torch
 
 
 SCHEMA_VERSION = 2
-GENERATOR_REVISION = "canonical-fourier-v4-strengths-wall-movies"
+GENERATOR_REVISION = "canonical-fourier-v5-buffered-cuda-graph"
 CHANNEL_NAMES = ("local conservative", "kernel conservative", "local active")
 SPLITS = ("train", "validation", "test")
 _SEED_OFFSETS = {"train": 0, "validation": 100_000, "test": 200_000}
@@ -63,6 +64,8 @@ class DatasetConfig:
     initial_mode: str = "stripe"
     movie_trajectories: int = 0
     movie_window_steps: int = 16
+    # Explicit opt-in; 0 keeps eager burn-in. Part of dataset provenance.
+    cuda_graph_steps: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ells", tuple(float(x) for x in self.ells))
@@ -76,7 +79,7 @@ class DatasetConfig:
             raise ValueError("ells must contain at least two distinct positive finite ranges")
         integer_fields = ("n", "burn_steps", "production_steps", "sample_every", "blocks",
                           "train_trajectories", "validation_trajectories", "test_trajectories",
-                          "base_seed", "movie_trajectories", "movie_window_steps")
+                          "base_seed", "movie_trajectories", "movie_window_steps", "cuda_graph_steps")
         for name in integer_fields:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
@@ -85,6 +88,8 @@ class DatasetConfig:
             raise ValueError("n must be an even integer >= 4")
         if self.burn_steps < 0 or self.base_seed < 0 or self.blocks < 2:
             raise ValueError("burn_steps/base_seed must be nonnegative and blocks >= 2")
+        if not 0 <= self.cuda_graph_steps <= 100:
+            raise ValueError("cuda_graph_steps must lie in [0,100]; 0 disables CUDA graphs")
         if min(self.production_steps, self.sample_every, self.train_trajectories,
                self.validation_trajectories, self.test_trajectories) <= 0:
             raise ValueError("production, sampling, and trajectory counts must be positive")
@@ -575,6 +580,11 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
     rng = torch.Generator(device=device).manual_seed(model.p.seed)
     count = cfg.production_steps // cfg.sample_every
     video = torch.empty((count + 1, 1, cfg.n, cfg.n), dtype=torch.float32)
+    # Keep a bounded staging buffer on device instead of synchronizing CUDA
+    # with .cpu() for every saved frame (v3 saves every production step).
+    frame_chunk = min(64, count + 1)
+    frame_buffer = torch.empty((frame_chunk, cfg.n, cfg.n),
+                               dtype=torch.float32, device=device)
     reference = torch.empty((count, 3), **kw)
     branches = torch.empty((count, cfg.max_distance + 1), **kw)
     mass = torch.empty(count + 1, **kw)
@@ -601,7 +611,10 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
         return new, canonical
 
     def record(index):
-        video[index, 0] = phi.float().cpu()
+        slot = index % frame_chunk
+        frame_buffer[slot].copy_(phi)
+        if slot == frame_chunk - 1 or index == count:
+            video[index - slot:index + 1, 0].copy_(frame_buffer[:slot + 1].cpu())
         mass[index], variance[index] = phi.mean(), phi.var(correction=0)
         power = ph.abs().square() * multiplicity
         bulk = model.dV * (cfg.a / 2 * phi.square() + cfg.b / 4 * phi.pow(4)).sum()
@@ -611,7 +624,15 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
         return model.dV * cfg.strength / 2 * (shell * power).sum(dim=(1, 2))
 
     with torch.inference_mode():
-        for step in range(cfg.burn_steps):
+        completed_burn = 0
+        if cfg.cuda_graph_steps:
+            from models.lramb_cuda import graph_burn_in
+            phi, ph, graph_error, completed_burn = graph_burn_in(
+                _step, phi, ph, linear, q2, noise_scale, rng,
+                dt_mobility=cfg.dt * cfg.mobility, b=cfg.b, lam=cfg.lam,
+                dx=cfg.dx, steps=cfg.burn_steps, chunk_steps=cfg.cuda_graph_steps)
+            max_fourier_state_error = torch.maximum(max_fourier_state_error, graph_error)
+        for step in range(completed_burn, cfg.burn_steps):
             phi, ph = advance()
             if step % 100 == 0 and (not torch.isfinite(phi).all() or phi.abs().max() > 30):
                 raise FloatingPointError("Unstable burn-in trajectory; reduce dt")
@@ -685,6 +706,7 @@ def _generation_source(root: Path) -> dict[str, str]:
     return dict(lramb_root=str(root),
                 lramb_model_sha256=sha256((root / "lramb/model.py").read_bytes()).hexdigest(),
                 lramb_torch_backend_sha256=sha256((root / "lramb/torch_backend.py").read_bytes()).hexdigest(),
+                cuda_graph_sha256=sha256(Path(__file__).with_name("lramb_cuda.py").read_bytes()).hexdigest(),
                 generator_sha256=sha256(Path(__file__).read_bytes()).hexdigest())
 
 
@@ -702,6 +724,8 @@ def prepare_generation(config: DatasetConfig, output_dir: str | Path,
         raise TypeError("config must be a DatasetConfig")
     root, _ = _lramb_module(lramb_root)
     backend = _backend(device)
+    if config.cuda_graph_steps and torch.device(backend["device"]).type != "cuda":
+        raise ValueError("cuda_graph_steps requires CUDA; use 0 for CPU generation")
     backend["device"] = torch.device(backend["device"]).type
     source = _generation_source(root)
     signature_input = dict(schema_version=SCHEMA_VERSION, config=config.to_dict(),
@@ -818,6 +842,7 @@ def generate_trajectory_task(task: dict[str, Any], *, device: str = "cpu",
               f"seed={task['seed']}, {config.burn_steps + config.production_steps:,} steps "
               f"({backend['name']}/{backend['device']})", flush=True)
     capture_movie = split == "test" and task["trajectory_index"] < config.movie_trajectories
+    started = time.perf_counter()
     trajectory = (_run_numpy(model, effective, multipliers, capture_movie=capture_movie)
                   if backend["name"] == "numpy" else
                   _run_torch(model, effective, multipliers, backend["device"], capture_movie=capture_movie))
@@ -846,8 +871,13 @@ def generate_trajectory_task(task: dict[str, Any], *, device: str = "cpu",
                                payload["reference_increment"].sum(1) / config.duration,
                                atol=1e-9, rtol=1e-9)
     _atomic_torch(payload, path)
+    elapsed = time.perf_counter() - started
+    if progress:
+        print(f"generated {condition['condition_id']}/{split} seed={task['seed']}: "
+              f"{elapsed:.2f} s, {(config.burn_steps + config.production_steps) / elapsed:.1f} "
+              f"steps/s; CUDA graph chunk={config.cuda_graph_steps}", flush=True)
     return dict(file=task["file"], condition_id=condition["condition_id"], split=split,
-                seed=task["seed"], cached=False)
+                seed=task["seed"], cached=False, elapsed_seconds=elapsed)
 
 
 def finalize_generation(output_dir: str | Path) -> dict[str, Any]:
