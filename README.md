@@ -24,6 +24,28 @@ Results are saved under `KNEEP/results/saou_perform/` and
 Both plot commands accept `--results-dir PATH` and `--dpi 300`.
 Move previous results aside before training with changed experiment settings.
 
+## Poisson circular-cluster sanity notebook
+
+Open [demos/poisson_sanity.ipynb](demos/poisson_sanity.ipynb) for editable
+64x64 circular-droplet experiments, centred on g=1 and ell=8. Initialization
+solves a radial local-passive boundary-value problem with centre/exterior
+Neumann conditions and fixed disk mass, then by default continues to a
+stationary solution of the actual periodic Poisson+active lattice equation.
+The chemical potential is solved with the field; curved-droplet bulk values
+are not artificially pinned to +/-1. Failed initialization is reported separately
+from dynamical instability, with no tanh fallback.
+
+The notebook compares a reference droplet with an equal-mass shape perturbation
+using float64 Euler-Maruyama and shared conserved noise on CUDA or CPU.
+Defaults include deterministic controls, g/ell/radius changes, and D=0.1.
+Editable cells show profile movies, radius, circularity, components, bulk values,
+mass drift and paired shape-mode growth. Sparse trajectories are cached under
+`results/poisson_sanity/`. No EP is calculated; D=0 is supported exactly.
+Set `INITIALIZATION="local_bvp"` for a common-profile quench instead of a
+stationary-branch experiment. Requires the sibling LRAMB repository and existing
+NumPy/SciPy/PyTorch/Matplotlib/tqdm dependencies. The notebook has not been executed;
+survival labels describe only the selected observation window.
+
 ## LRAMB Poisson interaction range
 
 Open [demos/lramb_poisson_range.ipynb](demos/lramb_poisson_range.ipynb) for separate
@@ -48,6 +70,12 @@ from one master seed. Data and checkpoints are cached under
 `results/lramb_single_run/`. The sibling LRAMB package is required; CNEEP_v2
 is a design reference, not a runtime import. This notebook has not been executed
 as part of its creation.
+Set `FIT_OUTPUT_ROOT` in the single-run settings cell to place checkpoints and
+figures on another filesystem while keeping the data cache under `OUTPUT_ROOT`.
+Checkpoint writes use a temporary file and atomic replacement. On a write
+failure, the training cell stops with the destination/free-space details and
+keeps an independent CPU payload in `checkpoint_recovery`; preserve the live
+kernel to recover it. Filesystem free space does not account for user quotas.
 
 The default `production_v3` compares **13 conditions**:
 `g=(0.5,1,2) x ell=(1,2,4,8)` plus one `g=0` control. The Poisson multiplier is
