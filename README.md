@@ -59,14 +59,21 @@ simulation, model, training and matplotlib cells: a burn-in/production profile
 movie and steady diagnostics, live raw/EMA losses, cumulative/window EP,
 time-averaged medium versus predicted maps, and separate mean/fluctuation
 predicted shell spectra. It follows the selected architecture in
-`CNEEP_v2/notebooks/Corr_AMB2D_ShellForce.ipynb`: width 64, depth 3, radius 3,
+`CNEEP_v2/notebooks/Corr_AMB2D_ShellForce.ipynb`, with width 128, hidden depth 2, radius 3,
 ELU, absolute shell inputs without nonlocal biases, AdamW lr=1e-3 / wd=0,
 logical batch 2048, 5000 updates, one fit seed (3). Microbatch 128 limits GPU
 activation memory. There are no plotting/training utility wrappers in its cells.
-The physical defaults are the LRAMB domain-wall case, 64x64, D=0.1,
-Poisson g=1 and ell=8. Its train/validation/test ensembles are 102/26/1,
-with 1000/1000/5000 production transitions and disjoint noise streams derived
-from one master seed. Data and checkpoints are cached under
+The physical defaults are 32x32, dx=1, a=-1, b=kappa=M=1, lambda=0.8,
+D=0.1, Poisson g=0.3 and ell=1, with nominal droplet radius 8.
+Initialization follows `poisson_sanity`: radial Neumann/mass-constrained BVP,
+then periodic stationary continuation. The solved field mean is preserved;
+it is not forced to zero. Solver residuals and mass drift are printed without
+strict numerical acceptance cutoffs. Nonfinite states still stop execution.
+Train/validation/test ensembles are 128/16/1, with 1024/1024/5000 production
+transitions, 100,000 burn-in steps per trajectory (dt=0.01), ensemble batch 128,
+and trace stride 100. Disjoint noise streams derive from one master seed.
+The initial-field hash and initializer settings enter the new data cache key.
+Data and checkpoints are cached under
 `results/lramb_single_run/`. The sibling LRAMB package is required; CNEEP_v2
 is a design reference, not a runtime import. This notebook has not been executed
 as part of its creation.
