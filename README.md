@@ -84,6 +84,70 @@ failure, the training cell stops with the destination/free-space details and
 keeps an independent CPU payload in `checkpoint_recovery`; preserve the live
 kernel to recover it. Filesystem free space does not account for user quotas.
 
+### Single-run script (Linux / tmux)
+
+[scripts/lramb_single_run.py](scripts/lramb_single_run.py) is a standalone
+version of the current single-run notebook. It contains the solver, initializer,
+model, training and plotting code; it does not execute notebook cells or require
+Jupyter/IPython. Defaults match the notebook settings above. Run from `KNEEP/`
+with your activated Python environment:
+
+```bash
+tmux new -s lramb-single
+python -u scripts/lramb_single_run.py --device cuda:0 2>&1 | tee single_run.log
+```
+
+Detach with `Ctrl-b`, then `d`; reconnect with `tmux attach -t lramb-single`.
+Use `--device cuda:1` to select another GPU, or `--device cpu` for CPU execution.
+Each invocation runs one experiment on one selected device.
+
+```bash
+# Continue an interrupted fit from its matching last.pt:
+python -u scripts/lramb_single_run.py --device cuda:0 --resume
+
+# Generate/cache data and save profile/steady diagnostics only:
+python -u scripts/lramb_single_run.py --device cuda:0 --stage generate
+
+# Re-evaluate a saved model and regenerate figures, without training:
+python -u scripts/lramb_single_run.py --device cuda:0 --stage evaluate
+```
+
+Default output is `results/lramb_single_run/data_<hash>/fit_<hash>/`.
+The data cache and checkpoint signatures follow the notebook's conventions;
+matching completed data are reused. `--resume` restores model, optimizer,
+scheduler, sampler and history at the last saved iteration (normally every 100
+updates), up to the configured iteration limit. Keep the same settings when
+resuming: changing training settings, including the iteration limit, selects a
+different fit directory. A completed fit proceeds to evaluation with `--resume`.
+Incomplete dataset generation restarts generation; it is not resumed per step.
+
+Training logs include sampled train loss, full-validation loss, LR and best
+iteration. `training_loss.png` is refreshed at each recorded evaluation.
+Other outputs include `training_loss_raw.png`, `steady_diagnostics.png`,
+`performance.png`, `time_averaged_medium_vs_pred.png`,
+`pred_spectrum_mean.png`, `pred_spectrum_fluctuation.png`, `evaluation.npz`,
+checkpoints and the resolved configuration. The initial profile is saved as
+`data_<hash>/initial_profile.png`. The profile movie includes burn-in and
+production: `profile.mp4` when ffmpeg is available, otherwise `profile.html`.
+Use `--movie html`, `--movie mp4`, or `--movie none` to select explicitly.
+
+Edit the settings dictionaries in the script or provide a JSON override:
+
+```json
+{"TRAIN": {"microbatch": 64}, "DATA": {"ensemble_batch": 128}}
+```
+
+```bash
+python -u scripts/lramb_single_run.py --device cuda:0 --config single_run.json
+```
+
+`--output-dir` changes the data root; `--fit-output-dir` places checkpoints and
+figures on a separate filesystem; `--lramb-root` selects the LRAMB repository.
+Use the same path/config options for subsequent resume/evaluate commands.
+Plot blocks are directly editable in the script. The notebook and script are
+separate source files: later notebook edits are not imported automatically.
+The script has not been executed as part of this change.
+
 The default `production_v3` compares **13 conditions**:
 `g=(0.5,1,2) x ell=(1,2,4,8)` plus one `g=0` control. The Poisson multiplier is
 `Khat(q)=exp(-ell*q)` for nonzero q and `Khat(0)=0`. The control retains local
