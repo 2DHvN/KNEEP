@@ -165,6 +165,37 @@ Plot blocks are directly editable in the script. The notebook and script are
 separate source files: later notebook edits are not imported automatically.
 The script has not been executed as part of this change.
 
+### Single-run Slurm job
+
+[scripts/lramb_single_run.slurm](scripts/lramb_single_run.slurm) requests one GPU,
+four CPU cores and 16 GB of host RAM. It retains the existing cluster's `gpu1`
+exclusion; edit that directive and add a partition/account if your cluster needs
+them. It uses the currently activated Python environment instead of assuming a
+conda installation path. From `KNEEP/`:
+
+```bash
+conda activate kneep
+export KNEEP_PYTHON="$(command -v python)"
+sbatch scripts/lramb_single_run.slurm
+
+# Pass single-run options after the Slurm filename:
+sbatch scripts/lramb_single_run.slurm --config my_run.json
+sbatch scripts/lramb_single_run.slurm --config my_run.json --resume
+sbatch scripts/lramb_single_run.slurm --config my_run.json --stage evaluate
+```
+
+The log is `lramb_single_<jobid>.log` in the submission directory. CLI arguments
+such as `--config my_run.json` are relative to that directory. Submission also
+works from `KNEEP/scripts/` or the parent workspace; from elsewhere, export
+`KNEEP_ROOT=/absolute/path/to/KNEEP` first. For a different interpreter, export
+`KNEEP_PYTHON=/absolute/path/to/environment/bin/python`.
+
+Slurm resource overrides go **before** the filename, for example
+`sbatch --mem=32G scripts/lramb_single_run.slurm --config my_run.json`.
+The allocation's GPU is addressed as `cuda:0`; requesting more GPUs does not
+parallelize this single-run script. The job has not been submitted or executed
+as part of this change.
+
 The default `production_v3` compares **13 conditions**:
 `g=(0.5,1,2) x ell=(1,2,4,8)` plus one `g=0` control. The Poisson multiplier is
 `Khat(q)=exp(-ell*q)` for nonzero q and `Khat(0)=0`. The control retains local
