@@ -93,20 +93,20 @@ def run(args):
 
     GRID = dict(n=32, dx=1.0)
     BASE = dict(a=-1.0, b=1.0, kappa=1.0, mobility=1.0,
-                g=0.3, ell=1.0, lam=0.8, D=0.1, radius=8.0)
+                g=0, ell=1.0, lam=0.1, D=0.1, radius=8.0)
     PHYS = dict(**GRID, **{k:v for k,v in BASE.items() if k != "radius"},
                 dt=0.01, kernel="poisson", alpha=1.0)
     # mean is set from the solved circular initial field below, not forced to zero.
     INITIALIZATION = "periodic_stationary"  # "local_bvp": quench from the local solution
     BVP = dict(nodes=400, tol=1e-5, max_nodes=12000)
     ROOT = dict(tol=1e-7, maxiter=100, continuation_steps=8)
-    DATA = dict(train_members=128, validation_members=16, test_members=1,
+    DATA = dict(train_members=1024, validation_members=128, test_members=1,
                 train_steps=1024, validation_steps=1024, test_steps=5000,
-                burn_steps=100000, ensemble_batch=128, trace_stride=100)
-    MODEL = dict(n_channel=128, n_hidden=2, max_distance=3,
+                burn_steps=100000, ensemble_batch=1024, trace_stride=100)
+    MODEL = dict(n_channel=128, n_hidden=3, max_distance=6,
                  shell_force_bias=False, activation="elu")
-    TRAIN = dict(iterations=5000, batch_size=2048, microbatch=128,
-                 evaluation_batch=256, lr=1e-3, weight_decay=0.0,
+    TRAIN = dict(iterations=30000, batch_size=2048, microbatch=128,
+                 evaluation_batch=256, lr=1e-2, weight_decay=1e-5,
                  alpha=-0.5, clip_norm=1.0, record_every=100,
                  scheduler="none", plateau_factor=0.5, plateau_patience=3,
                  plateau_threshold=1e-3, min_lr=1e-5)
