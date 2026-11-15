@@ -300,7 +300,7 @@ def run(args):
     n, dt, dV = PHYS["n"], PHYS["dt"], PHYS["dx"] ** 2
     field_bytes = sum(DATA[f"{s}_members"] * (DATA[f"{s}_steps"] + 1) * n*n*4
                       for s in ("train", "validation", "test"))
-    medium_bytes = DATA["test_members"] * DATA["test_steps"] * (n*n + 3) * 8
+    medium_bytes = DATA["test_members"] * DATA["test_steps"] * (2*n*n + 3) * 8
     print("Device:", DEVICE, "| sole condition:", {k: PHYS[k] for k in ("kernel", "g", "ell")})
     print("Field + reference arrays:", round((field_bytes + medium_bytes) / 1e9, 3), "GB")
     print("Data:", DATA_DIR)
@@ -382,6 +382,18 @@ def run(args):
                             bulk+gradient+long_range, lowq), dim=-1)
 
     # ---- Generate or reuse the ensemble data ----
+    # Optional reference sidecar: adding it does not change data/fit signatures.
+    ACTIVE_PATH = DATA_DIR / "test_active_density.npy"
+    ACTIVE_META_PATH = DATA_DIR / "test_active_density.json"
+
+    def save_active_metadata(source):
+        metadata = dict(schema=1, data_signature=DATA_ID, source=source,
+                        quantity="-lambda*grad(phi_mid)^2*dphi/D; density increment",
+                        system_entropy=False)
+        temporary = ACTIVE_META_PATH.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        temporary.replace(ACTIVE_META_PATH)
+
     @torch.inference_mode()
     def generate_split(split):
         members, steps = DATA[f"{split}_members"], DATA[f"{split}_steps"]
@@ -397,6 +409,10 @@ def run(args):
             maps = np.lib.format.open_memmap(DATA_DIR / "test_medium_density.npy",
                 mode="w+", dtype=np.float64, shape=(members, steps, n, n))
 
+            active_temporary = ACTIVE_PATH.with_suffix(".tmp.npy")
+            active_maps = np.lib.format.open_memmap(active_temporary, mode="w+",
+                dtype=np.float64, shape=(members, steps, n, n))
+
         for first in range(0, members, DATA["ensemble_batch"]):
             last = min(first + DATA["ensemble_batch"], members)
             size = last-first
@@ -408,6 +424,7 @@ def run(args):
                                        device=DEVICE, dtype=torch.float32)
             if split == "test":
                 map_buffer = torch.empty((size, min(chunk, steps), n, n), **kw)
+                active_buffer = torch.empty_like(map_buffer)
                 increment = torch.empty((size, steps, 3), **kw)
             trace_times, trace_fields, trace_diag = [], [], []
 
@@ -435,8 +452,10 @@ def run(args):
                     increment[:, j] = ds.sum((-2,-1)) * dV
                     slot = j % map_buffer.shape[1]
                     map_buffer[:, slot] = ds.sum(1)
+                    active_buffer[:, slot] = ds[:, 2]
                     if slot == map_buffer.shape[1]-1 or j == steps-1:
                         maps[first:last, j-slot:j+1] = map_buffer[:, :slot+1].cpu().numpy()
+                        active_maps[first:last, j-slot:j+1] = active_buffer[:, :slot+1].cpu().numpy()
                 phi, ph = new, new_hat
                 if step % 100 == 0 or step == burn+steps:
                     if not bool(torch.isfinite(phi).all()):
@@ -459,6 +478,10 @@ def run(args):
         if split == "test":
             ref.flush()
             maps.flush()
+            active_maps.flush()
+            del active_maps
+            active_temporary.replace(ACTIVE_PATH)
+            save_active_metadata("float64_solver_midpoint")
 
     required = ["train_video.npy", "validation_video.npy", "test_video.npy",
                 "test_medium_increment.npy", "test_medium_density.npy", "test_trace.npz"]
@@ -487,6 +510,34 @@ def run(args):
     test_video = np.load(DATA_DIR / "test_video.npy", mmap_mode="r")
     medium_increment = np.load(DATA_DIR / "test_medium_increment.npy", mmap_mode="r")
     medium_density_increment = np.load(DATA_DIR / "test_medium_density.npy", mmap_mode="r")
+    # Scalar active reference is already stored exactly in medium component index 2.
+    # Only old caches lack its spatial density. Reconstruct that map without
+    # regenerating trajectories or changing the trained model's cache signature.
+    active_metadata = json.loads(ACTIVE_META_PATH.read_text(encoding="utf-8")) if ACTIVE_META_PATH.exists() else {}
+    active_ready = (ACTIVE_PATH.exists() and active_metadata.get("schema") == 1
+                    and active_metadata.get("data_signature") == DATA_ID)
+    if not active_ready:
+        print("Reconstructing active density from cached float32 fields; scalar reference remains solver precision.")
+        temporary = ACTIVE_PATH.with_suffix(".tmp.npy")
+        active_maps = np.lib.format.open_memmap(temporary, mode="w+", dtype=np.float64,
+            shape=(test_video.shape[0], test_video.shape[1]-1, n, n))
+        with torch.inference_mode():
+            for member in range(test_video.shape[0]):
+                for first in tqdm(range(0, test_video.shape[1]-1, 128), desc="active reference map", leave=False):
+                    last = min(first+128, test_video.shape[1]-1)
+                    old = torch.as_tensor(np.array(test_video[member, first:last], dtype=np.float64), **kw)
+                    new = torch.as_tensor(np.array(test_video[member, first+1:last+1], dtype=np.float64), **kw)
+                    _, grad2 = neighbours((old+new)/2)
+                    active_maps[member, first:last] = (-PHYS["lam"]*grad2*(new-old)/PHYS["D"]).cpu().numpy()
+        active_maps.flush()
+        del active_maps
+        temporary.replace(ACTIVE_PATH)
+        save_active_metadata("reconstructed_from_float32_fields")
+        active_metadata = json.loads(ACTIVE_META_PATH.read_text(encoding="utf-8"))
+    active_density_increment = np.load(ACTIVE_PATH, mmap_mode="r")
+    active_map_source = active_metadata["source"]
+    print("Active-only density source:", active_map_source)
+
     with np.load(DATA_DIR / "test_trace.npz") as stored:
         trace = {name: stored[name].copy() for name in stored.files}
     print("Train / validation / test shapes:",
@@ -908,11 +959,15 @@ def run(args):
     pred_mean_density = pred_map_sum.cpu().numpy() / (length*dt*dV)
     ref_increment = np.array(medium_increment[:, start:stop], dtype=np.float64)
     medium_mean_density = np.empty((members, n, n), dtype=np.float64)
+    active_mean_density = np.empty_like(medium_mean_density)
     for member in range(members):
         medium_mean_density[member] = np.mean(
             medium_density_increment[member, start:stop], axis=0, dtype=np.float64) / dt
+        active_mean_density[member] = np.mean(
+            active_density_increment[member, start:stop], axis=0, dtype=np.float64) / dt
     pred_total = pred_increment.sum(-1)
     medium_total = ref_increment.sum(-1)
+    active_total = ref_increment[..., 2]  # solver midpoint, no system entropy correction
     duration = length*dt
     radii = np.arange(shells) * PHYS["dx"]
 
@@ -924,6 +979,12 @@ def run(args):
     print("Max medium map-integral residual:",
           np.max(np.abs(ref_map_rate-medium_total.sum(1)/duration)))
 
+
+    active_map_rate = active_mean_density.sum((1,2))*dV
+    print("Max active map-integral residual:",
+          np.max(np.abs(active_map_rate-active_total.sum(1)/duration)),
+          "| map source:", active_map_source)
+
     # ---- Cumulative and window-averaged EP ----
     WINDOW_STEPS = 64
     PERFORMANCE_TRAJECTORY = 0       # None: test ensemble mean
@@ -932,10 +993,12 @@ def run(args):
     if PERFORMANCE_TRAJECTORY is None:
         p = pred_total.mean(0)
         r = medium_total.mean(0)
+        a_ref = active_total.mean(0)
         curve_label = "test ensemble mean"
     else:
         p = pred_total[PERFORMANCE_TRAJECTORY]
         r = medium_total[PERFORMANCE_TRAJECTORY]
+        a_ref = active_total[PERFORMANCE_TRAJECTORY]
         curve_label = f"test trajectory {PERFORMANCE_TRAJECTORY}"
 
     edges = np.arange(length+1)*dt
@@ -945,12 +1008,15 @@ def run(args):
     window_time = (starts+ends)*dt/2
     pred_window = np.add.reduceat(p, starts) / window_duration
     medium_window = np.add.reduceat(r, starts) / window_duration
+    active_window = np.add.reduceat(a_ref, starts) / window_duration
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-    axes[0].plot(edges, np.r_[0.0, np.cumsum(r)], label="midpoint medium", color="C1")
+    axes[0].plot(edges, np.r_[0.0, np.cumsum(r)], label="full medium reference", color="C1")
+    axes[0].plot(edges, np.r_[0.0, np.cumsum(a_ref)], label="active-only reference", color="C2", ls="--")
     axes[0].plot(edges, np.r_[0.0, np.cumsum(p)], label="KNEEP prediction", color="C0")
     axes[0].set(xlabel="elapsed time in selected interval", ylabel="cumulative EP")
-    axes[1].plot(window_time, medium_window, label="midpoint medium", color="C1")
+    axes[1].plot(window_time, medium_window, label="full medium reference", color="C1")
+    axes[1].plot(window_time, active_window, label="active-only reference", color="C2", ls="--")
     axes[1].plot(window_time, pred_window, label="KNEEP prediction", color="C0")
     axes[1].set(xlabel="elapsed time (window center)", ylabel="window mean EP / time",
                 title=f"Windows of up to {WINDOW_STEPS} steps")
@@ -964,7 +1030,11 @@ def run(args):
     pred_rate, medium_rate = float(p.sum()/duration), float(r.sum()/duration)
     ratio = pred_rate/medium_rate if abs(medium_rate) > 1e-12 else float("nan")
     print(f"Mean rate: pred={pred_rate:.6g}, medium={medium_rate:.6g}, pred/medium={ratio:.5g}")
-    print("These compare different EP gauges; the medium series excludes system entropy.")
+    active_rate = float(a_ref.sum()/duration)
+    active_ratio = pred_rate/active_rate if abs(active_rate)>1e-12 else float("nan")
+    print(f"Active-only mean rate={active_rate:.6g}, pred/active={active_ratio:.5g}")
+    print("Active-only = -integral mu_A o dphi / D; this is not a system-entropy correction.")
+    print("Both physical references exclude system entropy; KNEEP uses a stationary path gauge.")
 
     # ---- Time-averaged maps ----
     MAP_TRAJECTORY = 0              # None: ensemble mean
@@ -973,15 +1043,20 @@ def run(args):
     if MAP_TRAJECTORY is None:
         pred_map = pred_mean_density.sum(1).mean(0)
         medium_map = medium_mean_density.mean(0)
+        active_map = active_mean_density.mean(0)
     else:
         pred_map = pred_mean_density[MAP_TRAJECTORY].sum(0)
         medium_map = medium_mean_density[MAP_TRAJECTORY]
-    limit = max(float(np.abs(pred_map).max()), float(np.abs(medium_map).max()), 1e-12)
+        active_map = active_mean_density[MAP_TRAJECTORY]
+    limit = max(float(np.abs(pred_map).max()), float(np.abs(medium_map).max()),
+                float(np.abs(active_map).max()), 1e-12)
     limit = limit if MAP_VMAX is None else float(MAP_VMAX)
     norm = TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), constrained_layout=True)
-    for ax, value, title in zip(axes, (medium_map, pred_map),
-                                 ("Midpoint medium", "KNEEP prediction")):
+    active_title = ("Active-only (solver midpoint)" if active_map_source=="float64_solver_midpoint"
+                    else "Active-only (cached-field reconstruction)")
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5), constrained_layout=True)
+    for ax, value, title in zip(axes, (medium_map, active_map, pred_map),
+                                 ("Full medium", active_title, "KNEEP prediction")):
         image = ax.imshow(value, origin="lower", extent=extent, cmap=MAP_CMAP, norm=norm)
         ax.set(xlabel="x", ylabel="y",
                title=f"{title}\nspatial integral={value.sum()*dV:.5g}")
@@ -1048,10 +1123,13 @@ def run(args):
     eval_meta = dict(fit_signature=FIT_ID, data_signature=DATA_ID,
                      model_iteration=checkpoint["iteration"], start=start, stop=stop,
                      dt=dt, dx=PHYS["dx"], physics=PHYS,
-                     reference="all-component midpoint medium; no system entropy")
+                     reference="all-component midpoint medium; no system entropy",
+                     active_reference="active chemical potential only; no system entropy",
+                     active_map_source=active_map_source)
     np.savez_compressed(FIT_DIR / "evaluation.npz",
         predicted_increment=pred_increment, medium_increment=ref_increment,
         predicted_mean_density=pred_mean_density, medium_mean_density=medium_mean_density,
+        active_increment=active_total, active_mean_density=active_mean_density,
         radii=radii, metadata=json.dumps(eval_meta))
     print("Saved notebook outputs:", FIT_DIR)
     # Later, for plotting only:

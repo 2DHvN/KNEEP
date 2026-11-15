@@ -123,6 +123,23 @@ Incomplete dataset generation restarts generation; it is not resumed per step.
 
 Training logs include sampled train loss, full-validation loss, LR and best
 iteration. `training_loss.png` is refreshed at each recorded evaluation.
+Both the single-run notebook and script overlay the full medium reference,
+the active-chemical-potential-only reference, and KNEEP prediction in cumulative
+and window-averaged EP plots. The active contribution uses
+`mu_A=lambda*|grad(phi_mid)|^2` in `-mu_A*dphi/D`, with the same midpoint and
+spatial integration as full medium. Neither physical reference adds system
+entropy. The time-averaged map figure has three panels with one colour scale.
+`evaluation.npz` also saves `active_increment` and `active_mean_density`.
+
+Existing data and trained checkpoints can be reused with `--stage evaluate`;
+in the notebook, set `RUN_TRAINING=False` and rerun from the top. Scalar active
+increments already exist in medium component index 2. New generation stores
+`test_active_density.npy` directly from float64 solver states. For older caches,
+only the missing active map is reconstructed from float32 cached fields, without
+repeating burn-in. Its provenance is recorded in `test_active_density.json`,
+evaluation metadata and the map title; its spatial integral may differ slightly
+from the stored scalar reference due to field quantization.
+
 Other outputs include `training_loss_raw.png`, `steady_diagnostics.png`,
 `performance.png`, `time_averaged_medium_vs_pred.png`,
 `pred_spectrum_mean.png`, `pred_spectrum_fluctuation.png`, `evaluation.npz`,
