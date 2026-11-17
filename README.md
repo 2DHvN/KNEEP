@@ -70,19 +70,25 @@ simulation, model, training and matplotlib cells: a burn-in/production profile
 movie and steady diagnostics, live raw/EMA losses, cumulative/window EP,
 time-averaged medium versus predicted maps, and separate mean/fluctuation
 predicted shell spectra. It follows the selected architecture in
-`CNEEP_v2/notebooks/Corr_AMB2D_ShellForce.ipynb`, with width 128, hidden depth 2, radius 3,
-ELU, absolute shell inputs without nonlocal biases, AdamW lr=1e-3 / wd=0,
-logical batch 2048, 5000 updates, one fit seed (3). Microbatch 128 limits GPU
-activation memory. There are no plotting/training utility wrappers in its cells.
-The physical defaults are 32x32, dx=1, a=-1, b=kappa=M=1, lambda=0.8,
-D=0.1, Poisson g=0.3 and ell=1, with nominal droplet radius 8.
-Initialization follows `poisson_sanity`: radial Neumann/mass-constrained BVP,
-then periodic stationary continuation. The solved field mean is preserved;
-it is not forced to zero. Solver residuals and mass drift are printed without
-strict numerical acceptance cutoffs. Nonfinite states still stop execution.
-Train/validation/test ensembles are 128/16/1, with 1024/1024/5000 production
-transitions, 100,000 burn-in steps per trajectory (dt=0.01), ensemble batch 128,
-and trace stride 100. Disjoint noise streams derive from one master seed.
+`CNEEP_v2/notebooks/Corr_AMB2D_ShellForce.ipynb`, with width 64, hidden depth 3,
+radius 3, ELU, absolute shell inputs without nonlocal biases, AdamW lr=1e-3 /
+wd=0, logical batch 2048, 5000 updates, and fit seed 3. Microbatch 128 limits
+training activation memory; validation batch is 2048 and prediction batch is 256.
+Both the notebook and script default to 64x64, dx=1, a=-0.25, b=0.25,
+kappa=4, mobility=1, lambda=10, D=0.1, g=0, dt=0.001, and tanh radius 16.
+CNEEP uses -a*phi while KNEEP uses a*phi, hence the sign change.
+Train/validation/test ensembles are 102/26/1, with 999/999/4999 transitions
+(1000/1000/5000 frames), and 10,000 burn-in steps (physical time 10).
+KNEEP retains its spatial discretization, noise streams, and EP estimators;
+matching parameters does not imply identical numerical trajectories.
+
+`INITIALIZATION = "tanh"` uses
+`sqrt(-a/b) * tanh((radius-r) / sqrt(2*kappa/(-a)))`, with radius and width in
+physical length units, preserving the sampled mean before burn-in.
+`local_bvp` selects the radial Neumann/mass-constrained passive solution;
+`periodic_stationary` additionally performs periodic stationary continuation.
+The script also accepts `{"INITIALIZATION": "tanh"}` through `--config`.
+Solver residuals and mass drift are diagnostic; nonfinite states stop execution.
 The initial-field hash and initializer settings enter the new data cache key.
 Data and checkpoints are cached under
 `results/lramb_single_run/`. The sibling LRAMB package is required; CNEEP_v2

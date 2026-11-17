@@ -2,9 +2,9 @@
 """Standalone single-condition LRAMB experiment.
 
 Port of demos/lramb_single_run.ipynb; no notebook or IPython needed at runtime.
-Default: 32x32 Poisson g=0.3, ell=1, D=0.1, radius=8; radial BVP +
-periodic continuation; 100000 burn steps; 128/16/1 ensemble members.
-Euler-Maruyama, per-step midpoint medium EP, width 128 / hidden depth 2.
+Default: Corr_AMB2D_ShellForce parameters, 64x64, g=0, lambda=10, D=0.1;
+tanh radius=16; dt=0.001; 10000 burn steps; 102/26/1 ensemble members.
+Euler-Maruyama, per-step midpoint medium EP, width 64 / hidden depth 3.
 
 Examples (from KNEEP):
     python -u scripts/lramb_single_run.py --device cuda:0
@@ -91,22 +91,24 @@ def run(args):
     if DEVICE.type == "cuda":
         torch.cuda.set_device(DEVICE)
 
-    GRID = dict(n=32, dx=1.0)
-    BASE = dict(a=-1.0, b=1.0, kappa=1.0, mobility=1.0,
-                g=0, ell=1.0, lam=0.1, D=0.1, radius=8.0)
+    GRID = dict(n=64, dx=1.0)
+    BASE = dict(a=-0.25, b=0.25, kappa=4.0, mobility=1.0,
+                g=0.0, ell=1.0, lam=10.0, D=0.1, radius=16.0)
     PHYS = dict(**GRID, **{k:v for k,v in BASE.items() if k != "radius"},
-                dt=0.01, kernel="poisson", alpha=1.0)
-    # mean is set from the solved circular initial field below, not forced to zero.
-    INITIALIZATION = "periodic_stationary"  # "local_bvp": quench from the local solution
+                dt=0.001, kernel="poisson", alpha=1.0)
+    # Matches Corr_AMB2D_ShellForce: a changes sign between conventions; g=0.
+    # DATA steps count transitions: 999/4999 give 1000/5000 stored frames.
+    # mean is taken from the circular initial field below, not forced to zero.
+    INITIALIZATION = "tanh"  # Options: "periodic_stationary", "local_bvp", "tanh"
     BVP = dict(nodes=400, tol=1e-5, max_nodes=12000)
     ROOT = dict(tol=1e-7, maxiter=100, continuation_steps=8)
-    DATA = dict(train_members=1024, validation_members=128, test_members=1,
-                train_steps=1024, validation_steps=1024, test_steps=5000,
-                burn_steps=100000, ensemble_batch=1024, trace_stride=100)
-    MODEL = dict(n_channel=128, n_hidden=3, max_distance=6,
+    DATA = dict(train_members=102, validation_members=26, test_members=1,
+                train_steps=999, validation_steps=999, test_steps=4999,
+                burn_steps=10000, ensemble_batch=128, trace_stride=100)
+    MODEL = dict(n_channel=64, n_hidden=3, max_distance=3,
                  shell_force_bias=False, activation="elu")
-    TRAIN = dict(iterations=30000, batch_size=2048, microbatch=128,
-                 evaluation_batch=256, lr=1e-2, weight_decay=1e-5,
+    TRAIN = dict(iterations=5000, batch_size=2048, microbatch=128,
+                 evaluation_batch=2048, lr=1e-3, weight_decay=0.0,
                  alpha=-0.5, clip_norm=1.0, record_every=100,
                  scheduler="none", plateau_factor=0.5, plateau_patience=3,
                  plateau_threshold=1e-3, min_lr=1e-5)
@@ -138,9 +140,9 @@ def run(args):
     if PHYS["n"] < 4 or PHYS["n"] % 2 or PHYS["a"] >= 0 or PHYS["b"] <= 0:
         raise ValueError("Use even n >= 4 and a<0, b>0 for a circular double-well profile.")
     if PHYS["kappa"] <= 0:
-        raise ValueError("The BVP requires kappa>0.")
-    if INITIALIZATION not in ("periodic_stationary", "local_bvp"):
-        raise ValueError("Choose periodic_stationary or local_bvp.")
+        raise ValueError("Circular initialization requires kappa>0.")
+    if INITIALIZATION not in ("periodic_stationary", "local_bvp", "tanh"):
+        raise ValueError("Choose periodic_stationary, local_bvp, or tanh.")
     if not 0 <= MODEL["max_distance"] < PHYS["n"] // 2:
         raise ValueError("Keep max_distance below n/2 to avoid periodic duplicate offsets.")
     if min(DATA.values()) < 1 or min(TRAIN["microbatch"], TRAIN["batch_size"],
@@ -165,54 +167,60 @@ def run(args):
         length, rb = n*dx, n*dx/2
         a, b, kappa, radius = (BASE[k] for k in ("a","b","kappa","radius"))
         phi0, width = math.sqrt(-a/b), math.sqrt(2*kappa/(-a))
-        mean_disk = phi0*(2*(radius/rb)**2-1)
-        target_integral = mean_disk*rb**2/2
-        r = np.linspace(0,rb,BVP["nodes"])
-        singular = np.zeros((3,3))
-        singular[1,1] = -1.
-
-        def equation(r, y, p):
-            phi, derivative, integral = y
-            return np.vstack((derivative,(a*phi+b*phi**3-p[0])/kappa,r*phi))
-
-        def boundary(left, right, p):
-            return np.array([left[1],right[1],left[2],
-                             (right[2]-target_integral)/rb**2])
-
-        candidates = []
-        for factor in (1., .9, 1.1):
-            z = (factor*radius-r)/width
-            guess_phi = phi0*np.tanh(z)
-            guess = np.vstack((guess_phi,-phi0/width*(1-np.tanh(z)**2),
-                               cumulative_trapezoid(r*guess_phi,r,initial=0)))
-            solution = solve_bvp(equation,boundary,r,guess,
-                                p=[kappa*phi0/(radius*width)],S=singular,
-                                tol=BVP["tol"],bc_tol=BVP["tol"],max_nodes=BVP["max_nodes"])
-            values = solution.sol(np.linspace(0,rb,2001))[0]
-            residual = float(np.max(solution.rms_residuals))
-            # Keep a finite positive-core/negative-exterior branch, without tight
-            # residual/contrast/monotonicity cutoffs.
-            if np.isfinite(values).all() and values[0]>0 and values[-1]<0:
-                candidates.append((solution,residual))
-                if solution.success:
-                    break
-        if not candidates:
-            raise RuntimeError("BVP returned no finite circular-droplet branch; inspect BVP settings.")
-        solution, residual = min(candidates,key=lambda item: (not item[0].success,item[1]))
-        radial_info = dict(success=bool(solution.success), message=str(solution.message),
-                           max_rms_residual=residual,
-                           boundary_error=float(np.max(abs(boundary(solution.y[:,0],
-                                                                      solution.y[:,-1],solution.p)))),
-                           mu=float(solution.p[0]), nominal_radius=radius,
-                           crossing_radius=float(brentq(lambda x:float(solution.sol(x)[0]),0,rb)))
-        print("Radial BVP:", radial_info)
-        if not solution.success:
-            print("BVP status is nonconverged; using the finite droplet candidate shown above.")
-
         coord = np.arange(n)*dx-length/2
         x,y = np.meshgrid(coord,coord)
         distance = np.hypot(x,y)
-        local_field = solution.sol(np.minimum(distance,rb).ravel())[0].reshape(n,n)
+        if INITIALIZATION == "tanh":
+            # radius and interface width are in physical length units.
+            local_field = phi0*np.tanh((radius-distance)/width)
+            radial_info = dict(method="tanh", nominal_radius=radius,
+                               amplitude=phi0, interface_width=width)
+        else:
+            mean_disk = phi0*(2*(radius/rb)**2-1)
+            target_integral = mean_disk*rb**2/2
+            r = np.linspace(0,rb,BVP["nodes"])
+            singular = np.zeros((3,3))
+            singular[1,1] = -1.
+
+            def equation(r, y, p):
+                phi, derivative, integral = y
+                return np.vstack((derivative,(a*phi+b*phi**3-p[0])/kappa,r*phi))
+
+            def boundary(left, right, p):
+                return np.array([left[1],right[1],left[2],
+                                 (right[2]-target_integral)/rb**2])
+
+            candidates = []
+            for factor in (1., .9, 1.1):
+                z = (factor*radius-r)/width
+                guess_phi = phi0*np.tanh(z)
+                guess = np.vstack((guess_phi,-phi0/width*(1-np.tanh(z)**2),
+                                   cumulative_trapezoid(r*guess_phi,r,initial=0)))
+                solution = solve_bvp(equation,boundary,r,guess,
+                                    p=[kappa*phi0/(radius*width)],S=singular,
+                                    tol=BVP["tol"],bc_tol=BVP["tol"],max_nodes=BVP["max_nodes"])
+                values = solution.sol(np.linspace(0,rb,2001))[0]
+                residual = float(np.max(solution.rms_residuals))
+                # Keep a finite positive-core/negative-exterior branch, without tight
+                # residual/contrast/monotonicity cutoffs.
+                if np.isfinite(values).all() and values[0]>0 and values[-1]<0:
+                    candidates.append((solution,residual))
+                    if solution.success:
+                        break
+            if not candidates:
+                raise RuntimeError("BVP returned no finite circular-droplet branch; inspect BVP settings.")
+            solution, residual = min(candidates,key=lambda item: (not item[0].success,item[1]))
+            radial_info = dict(success=bool(solution.success), message=str(solution.message),
+                               max_rms_residual=residual,
+                               boundary_error=float(np.max(abs(boundary(solution.y[:,0],
+                                                                          solution.y[:,-1],solution.p)))),
+                               mu=float(solution.p[0]), nominal_radius=radius,
+                               crossing_radius=float(brentq(lambda x:float(solution.sol(x)[0]),0,rb)))
+            print("Radial BVP:", radial_info)
+            if not solution.success:
+                print("BVP status is nonconverged; using the finite droplet candidate shown above.")
+
+            local_field = solution.sol(np.minimum(distance,rb).ravel())[0].reshape(n,n)
         field = local_field.copy()
         target_mean = float(field.mean())
         wave = 2*np.pi*np.fft.fftfreq(n,d=dx)
@@ -262,12 +270,13 @@ def run(args):
         return np.ascontiguousarray(field), local_field, initial_info
 
     INITIAL_FIELD, LOCAL_BVP_FIELD, INITIAL_INFO = initialize_circle()
-    # Do not shift the BVP plateaus to impose mean=0.
+    # Preserve the initial profile mean; do not impose mean=0.
     PHYS["mean"] = float(INITIAL_FIELD.mean())
     fig, axes = plt.subplots(1,2,figsize=(10,4),constrained_layout=True)
     bound = max(float(abs(LOCAL_BVP_FIELD).max()),float(abs(INITIAL_FIELD).max()))
     for ax,field,title in zip(axes,(LOCAL_BVP_FIELD,INITIAL_FIELD),
-                             ("Radial BVP embedding","Chosen periodic initialization")):
+                             (("Analytic tanh profile" if INITIALIZATION == "tanh" else "Radial BVP embedding"),
+                             f"Chosen initialization: {INITIALIZATION}")):
         im = ax.imshow(field,origin="lower",extent=(0,n*GRID["dx"],0,n*GRID["dx"]),
                        cmap="RdBu_r",vmin=-bound,vmax=bound)
         ax.set(title=title,xlabel="x",ylabel="y")
@@ -927,7 +936,7 @@ def run(args):
     LOAD_BEST = args.checkpoint == "best"
     EVAL_START = 0
     EVAL_STOP = None                 # None: full held-out production interval
-    PREDICT_BATCH = TRAIN["evaluation_batch"]
+    PREDICT_BATCH = 256  # Corr_AMB2D_ShellForce opt.video_batch_size
 
     checkpoint_path = BEST_PATH if LOAD_BEST else LAST_PATH
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
