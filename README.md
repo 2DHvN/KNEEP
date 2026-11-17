@@ -51,6 +51,16 @@ Deterministic D=0 controls retain field/mode diagnostics; entropy divided by
 D is undefined for them. The default D=0.1 case supplies the EP maps. Set BASE D
 positive to compare EP across all controls. Numerical arrays are cached under
 `results/poisson_sanity/`; figures are built inline.
+
+The standalone equivalent is `scripts/poisson_sanity.py` (no notebook runtime).
+Run `python scripts/poisson_sanity.py --device cuda:0` to generate/reuse trajectories,
+save diagnostic PNGs, and export an HTML movie under the output directory.
+Use `--movie mp4` with ffmpeg, or `--movie none` to skip video export.
+`--output-dir PATH` selects the destination; `--config settings.json` overrides
+`GRID`, `BASE`, `RUN`, `BVP`, `ROOT`, `RULES`, `CASES`, `INITIALIZATION`,
+`REMOVE_ZERO_MODE`, or `MODE_MAX`. CASES entries override BASE per condition.
+Both versions end with a field movie and the central cut at fixed x=L/2:
+`phi(y) = fields[frame, :, n//2]`, with the cut marked on the field panel.
 Set `INITIALIZATION="local_bvp"` for a common-profile quench instead of a
 stationary-branch experiment. Requires the sibling LRAMB repository and existing
 NumPy/SciPy/PyTorch/Matplotlib/tqdm dependencies. Short-run validation covers the

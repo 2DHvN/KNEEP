@@ -2,8 +2,6 @@
 #SBATCH --job-name=lramb_poisson
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --exclude=gpu1
 #SBATCH --gres=gpu:4
 #SBATCH --output=lramb_poisson_%j.log
 
