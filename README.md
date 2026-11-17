@@ -27,7 +27,7 @@ Move previous results aside before training with changed experiment settings.
 ## Poisson circular-cluster sanity notebook
 
 Open [demos/poisson_sanity.ipynb](demos/poisson_sanity.ipynb) for editable
-64x64 circular-droplet experiments, centred on g=1 and ell=8. Initialization
+32x32 circular-droplet experiments, with current defaults g=0.3 and ell=1. Initialization
 solves a radial local-passive boundary-value problem with centre/exterior
 Neumann conditions and fixed disk mass, then by default continues to a
 stationary solution of the actual periodic Poisson+active lattice equation.
@@ -35,16 +35,27 @@ The chemical potential is solved with the field; curved-droplet bulk values
 are not artificially pinned to +/-1. Failed initialization is reported separately
 from dynamical instability, with no tanh fallback.
 
-The notebook compares a reference droplet with an equal-mass shape perturbation
-using float64 Euler-Maruyama and shared conserved noise on CUDA or CPU.
-Defaults include deterministic controls, g/ell/radius changes, and D=0.1.
-Editable cells show profile movies, radius, circularity, components, bulk values,
-mass drift and paired shape-mode growth. Sparse trajectories are cached under
-`results/poisson_sanity/`. No EP is calculated; D=0 is supported exactly.
+Each condition evolves one field using float64 Euler-Maruyama and conserved
+noise on CUDA or CPU. `RUN["burn_in"]` sets the equilibration time, followed by
+`RUN["duration"]` of production. Both default to 160 physical time units.
+Editable cells show x/y averaged-profile heatmaps, axial Fourier mode powers
+and amplitudes, field snapshots and a field/profile movie. Steady-state
+diagnostics cover initialization, the entire burn-in, and production, with
+the production boundary marked. They include mass, variance, conservative
+energy, structure mean q, drift RMS and interval EP rates, plus production
+EP block means. Extending burn-in may be necessary when structural drift remains.
+For D>0, midpoint medium EP is accumulated at every solver step; time-averaged
+local conservative, Poisson, active and total EP maps include production only.
+Their spatial integrals are checked against production entropy increments.
+Deterministic D=0 controls retain field/mode diagnostics; entropy divided by
+D is undefined for them. The default D=0.1 case supplies the EP maps. Set BASE D
+positive to compare EP across all controls. Numerical arrays are cached under
+`results/poisson_sanity/`; figures are built inline.
 Set `INITIALIZATION="local_bvp"` for a common-profile quench instead of a
 stationary-branch experiment. Requires the sibling LRAMB repository and existing
-NumPy/SciPy/PyTorch/Matplotlib/tqdm dependencies. The notebook has not been executed;
-survival labels describe only the selected observation window.
+NumPy/SciPy/PyTorch/Matplotlib/tqdm dependencies. Short-run validation covers the
+new burn-in/production bookkeeping and plots; default-duration stationarity
+must be assessed from the diagnostics.
 
 ## LRAMB Poisson interaction range
 
@@ -167,34 +178,31 @@ The script has not been executed as part of this change.
 
 ### Single-run Slurm job
 
-[scripts/lramb_single_run.slurm](scripts/lramb_single_run.slurm) requests one GPU,
-four CPU cores and 16 GB of host RAM. It retains the existing cluster's `gpu1`
-exclusion; edit that directive and add a partition/account if your cluster needs
-them. It uses the currently activated Python environment instead of assuming a
-conda installation path. From `KNEEP/`:
+[scripts/lramb_single_run.slurm](scripts/lramb_single_run.slurm) uses the same
+fixed working directory and Matplotlib cache path as the existing Poisson Slurm
+job. Python comes from `KNEEP_PYTHON`, or `python` on the inherited PATH;
+no conda installation path is hard-coded. It requests one GPU, four CPU cores and 16 GB RAM, with `gpu1`
+excluded. Edit these paths/directives directly if needed. There is no explicit
+`mkdir` or automatic repository/environment discovery.
+
+From `KNEEP/`, activate the intended environment and export its interpreter
+(the environment must also be accessible on the allocated compute node):
 
 ```bash
 conda activate kneep
 export KNEEP_PYTHON="$(command -v python)"
 sbatch scripts/lramb_single_run.slurm
-
-# Pass single-run options after the Slurm filename:
-sbatch scripts/lramb_single_run.slurm --config my_run.json
-sbatch scripts/lramb_single_run.slurm --config my_run.json --resume
-sbatch scripts/lramb_single_run.slurm --config my_run.json --stage evaluate
+sbatch scripts/lramb_single_run.slurm --config "$PWD/my_run.json"
+sbatch scripts/lramb_single_run.slurm --config "$PWD/my_run.json" --resume
+sbatch scripts/lramb_single_run.slurm --config "$PWD/my_run.json" --stage evaluate
 ```
 
-The log is `lramb_single_<jobid>.log` in the submission directory. CLI arguments
-such as `--config my_run.json` are relative to that directory. Submission also
-works from `KNEEP/scripts/` or the parent workspace; from elsewhere, export
-`KNEEP_ROOT=/absolute/path/to/KNEEP` first. For a different interpreter, export
-`KNEEP_PYTHON=/absolute/path/to/environment/bin/python`.
-
-Slurm resource overrides go **before** the filename, for example
-`sbatch --mem=32G scripts/lramb_single_run.slurm --config my_run.json`.
-The allocation's GPU is addressed as `cuda:0`; requesting more GPUs does not
-parallelize this single-run script. The job has not been submitted or executed
-as part of this change.
+Use absolute config/output paths: the job changes directory to
+`/pds/pds1/slurm_workspace/idh1203/KNEEP/scripts`.
+`KNEEP_PYTHON` can override the default interpreter. The log is
+`lramb_single_<jobid>.log` in the submission directory. Resource overrides go
+before the filename, e.g. `sbatch --mem=32G scripts/lramb_single_run.slurm`.
+The job has not been submitted or executed as part of this change.
 
 The default `production_v3` compares **13 conditions**:
 `g=(0.5,1,2) x ell=(1,2,4,8)` plus one `g=0` control. The Poisson multiplier is
