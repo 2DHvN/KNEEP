@@ -16,6 +16,7 @@ from pathlib import Path
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--cpu-threads", type=int, default=1)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--lramb-root", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -23,6 +24,8 @@ def parse_args():
     parser.add_argument("--movie-fps", type=int, default=12)
     parser.add_argument("--movie-max-frames", type=int, default=161)
     args = parser.parse_args()
+    if args.cpu_threads < 1:
+        parser.error("CPU thread count must be positive")
     if args.movie_fps < 1 or args.movie_max_frames < 2:
         parser.error("Movie FPS must be positive and max frames at least two.")
     return args
@@ -54,12 +57,14 @@ if __name__ == "__main__":
     LRAMB_ROOT = args.lramb_root.resolve() if args.lramb_root else KNEEP_ROOT.parent / "LRAMB"
     sys.path.insert(0, str(LRAMB_ROOT))
     from lramb.model import KernelSpec
+    from lramb import stencils as stencil_ops
+    from lramb.torch_stencils import RealSpaceStepper
     from lramb.circle import cluster_observables
 
     DEVICE = torch.device(("cuda:0" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device)
     if DEVICE.type == "cuda":
         torch.cuda.set_device(DEVICE)
-    torch.set_num_threads(1)
+    torch.set_num_threads(args.cpu_threads)
     plt.rcParams.update({"figure.dpi": 110, "axes.grid": True,
                          "grid.alpha": 0.2, "animation.embed_limit": 100})
     def display_table(rows):
@@ -82,7 +87,7 @@ if __name__ == "__main__":
     # ---- Notebook cell 3 ----
     GRID = dict(n=64, dx=1.0)
     BASE = dict(a=-0.25, b=0.25, kappa=4.0, mobility=1.0,
-                g=0.0, ell=1.0, lam=10.0, D=0.1, radius=16.0)
+                g=0.0, ell=1.0, lam=10.0, zeta=0.0, D=0.1, radius=16.0)
     # Matches Corr_AMB2D_ShellForce; KNEEP uses the opposite sign for a.
     CASES = [
         dict(name="target"),
@@ -124,7 +129,7 @@ if __name__ == "__main__":
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     FIGURE_ROOT = OUTPUT_ROOT / ("figures_" + time.strftime("%Y%m%d_%H%M%S"))
     FIGURE_ROOT.mkdir(parents=True, exist_ok=True)
-    NUMERICS_VERSION = "single-trajectory-xy-modes-burn-production-midpoint-ep-v2"
+    NUMERICS_VERSION = "tjhung-realspace-mixed-mobility-ep-v3"
 
     n, dx = GRID["n"], GRID["dx"]
     length, dV = n*dx, dx**2
@@ -276,23 +281,21 @@ if __name__ == "__main__":
         return multiplier
 
     def laplacian_numpy(phi):
-        return sum(np.roll(phi, 1, ax) + np.roll(phi, -1, ax) - 2*phi
-                   for ax in (-2, -1))/dx**2
+        return stencil_ops.laplacian9(phi,dx)
 
     def grad2_numpy(phi):
-        return sum((np.roll(phi, 1, ax)-phi)**2 + (np.roll(phi, -1, ax)-phi)**2
-                   for ax in (-2, -1))/(2*dx**2)
+        return stencil_ops.gradient_squared(phi,dx)
 
     def chemical_potential(phi, case):
-        convolution = np.fft.ifft2(kernel_multiplier(case)*np.fft.fft2(phi)).real
-        return (case["a"]*phi + case["b"]*phi**3 - case["kappa"]*laplacian_numpy(phi)
-                + case["g"]*convolution + case["lam"]*grad2_numpy(phi))
+        convolution = np.fft.ifft2(kernel_multiplier(case)*np.fft.fft2(phi)).real if case["g"] else 0.
+        return (case["a"]*phi+case["b"]*phi**3-case["kappa"]*laplacian_numpy(phi)
+                +case["g"]*convolution+stencil_ops.effective_active(phi,dx,case["lam"],case.get("zeta",0.)))
 
     def residual_report(phi, case):
-        mu = chemical_potential(phi, case)
-        drift = case["mobility"]*laplacian_numpy(mu)
-        return dict(mu=float(mu.mean()), mu_spread=float(np.max(abs(mu-mu.mean()))),
-                    drift_rms=float(np.sqrt(np.mean(drift**2))), square_mean=float(phi.mean()))
+        mu=chemical_potential(phi,case)
+        drift=case["mobility"]*stencil_ops.mobility8(mu,dx)
+        return dict(mu=float(mu.mean()),mu_spread=float(np.max(abs(mu-stencil_ops.null_projection(mu)))),
+                    drift_rms=float(np.sqrt(np.mean(drift**2))),square_mean=float(phi.mean()))
 
     # Reuse deterministic initial states for cases differing only by noise or name.
     INITIAL_STATES = {}
@@ -309,19 +312,20 @@ if __name__ == "__main__":
         else:
             field, radial_info, _ = local_bvp_field(case)
         target_mean = float(field.mean())
+        reference_field = field.copy()
         before = residual_report(field, case)
         continuation = []
         if INITIALIZATION == "periodic_stationary":
-            previous_mu = float(chemical_potential(field, {**case, "g":0., "lam":0.}).mean())
+            previous_mu = float(chemical_potential(field, {**case, "g":0., "lam":0., "zeta":0.}).mean())
             fractions = np.linspace(0., 1., ROOT["continuation_steps"]+1)
-            if case["g"] == 0 and case["lam"] == 0:
+            if case["g"] == 0 and case["lam"] == 0 and case.get("zeta",0.) == 0:
                 fractions = [0.]
             for fraction in fractions:
                 print(f"  stationary continuation {fraction:.2f}", flush=True)
-                current = {**case, "g":fraction*case["g"], "lam":fraction*case["lam"]}
+                current = {**case, "g":fraction*case["g"], "lam":fraction*case["lam"], "zeta":fraction*case.get("zeta",0.)}
                 def equation(z):
                     phi = z[:-1].reshape(n, n)
-                    return np.r_[(chemical_potential(phi, current)-z[-1]).ravel(),
+                    return np.r_[(stencil_ops.stationary_residual(phi,reference_field,chemical_potential(phi,current))+z[-1]).ravel(),
                                  n*n*(phi.mean()-target_mean)]
                 solved = root(equation, np.r_[field.ravel(), previous_mu], method="krylov",
                               options=dict(fatol=ROOT["tol"], maxiter=ROOT["maxiter"]))
@@ -372,14 +376,13 @@ if __name__ == "__main__":
     def evolve(initial, case, progress=True):
         dtype = torch.float64
         phi = torch.as_tensor(initial.copy(), dtype=dtype, device=DEVICE)
-        q2 = torch.as_tensor(Q2, dtype=dtype, device=DEVICE)
-        q = q2.sqrt()
+        q2 = torch.as_tensor(stencil_ops.symbols(n,dx)[0], dtype=dtype, device=DEVICE)
+        q = torch.as_tensor(np.sqrt(Q2), dtype=dtype, device=DEVICE)
         kernel = torch.as_tensor(kernel_multiplier(case), dtype=dtype, device=DEVICE)
-        linear = case["a"] + case["kappa"]*q2 + case["g"]*kernel
-        noise_scale = torch.sqrt(q2*(2*case["mobility"]*case["D"]*RUN["dt"]/dV))
+        stepper = RealSpaceStepper(n,dx,case["a"],case["b"],case["kappa"],case["lam"],
+            case["mobility"],case["D"],RUN["dt"],kernel,case["g"],case.get("zeta",0.),DEVICE,dtype)
         rng = torch.Generator(device=DEVICE).manual_seed(RUN["seed"])
         initial_mean = phi.mean().clone()
-        zero_coefficient = initial_mean*n  # 2D orthonormal FFT
         phi_hat = torch.fft.fft2(phi, norm="ortho")
         ep_defined = case["D"] > 0
         maps = torch.zeros((4,n,n), dtype=dtype, device=DEVICE)
@@ -391,16 +394,8 @@ if __name__ == "__main__":
                                     "mean_q", "mu_spread", "drift_rms", "axial_modes")}
         ep_time, ep_duration, ep_phase, ep_increment = [], [], [], []
 
-        def grad2(field):
-            return sum((torch.roll(field,1,ax)-field).square()
-                       +(torch.roll(field,-1,ax)-field).square() for ax in (-2,-1))/(2*dx**2)
-
         def potentials(field, field_hat):
-            lap = sum(torch.roll(field,1,ax)+torch.roll(field,-1,ax)-2*field
-                      for ax in (-2,-1))/dx**2
-            local = case["a"]*field+case["b"]*field.pow(3)-case["kappa"]*lap
-            nonlocal_mu = case["g"]*torch.fft.ifft2(kernel*field_hat, norm="ortho").real
-            return torch.stack((local, nonlocal_mu, case["lam"]*grad2(field)))
+            return stepper.potentials(field)
 
         def record(step):
             nonlocal interval_start
@@ -411,14 +406,14 @@ if __name__ == "__main__":
                 dV*case["kappa"]/2*(q2*power).sum(),
                 dV*case["g"]/2*(kernel*power).sum()))
             mu = potentials(phi, phi_hat).sum(0)
-            drift = torch.fft.ifft2(-case["mobility"]*q2*torch.fft.fft2(mu,norm="ortho"),norm="ortho").real
+            drift = stepper.drift(phi)
             # Array axes are [y,x]. Fourier coefficients are normalized by n*n.
             modes = torch.stack((phi_hat[0,1:MODE_MAX+1], phi_hat[1:MODE_MAX+1,0]))/n
             state["fields"].append(phi.float().cpu().numpy().copy())
             state["time"].append(step*RUN["dt"])
             for key, value in (("mass_mean",phi.mean()), ("variance",phi.var(correction=0)),
                 ("energy",energy), ("mean_q",(q*connected).sum()/connected.sum().clamp_min(1e-30)),
-                ("mu_spread",(mu-mu.mean()).abs().max()), ("drift_rms",drift.square().mean().sqrt()),
+                ("mu_spread",(mu-stepper.null_projection(mu)).abs().max()), ("drift_rms",drift.square().mean().sqrt()),
                 ("axial_modes",modes)):
                 state[key].append(value.cpu().numpy().copy())
             if step > interval_start:
@@ -432,13 +427,9 @@ if __name__ == "__main__":
 
         record(0)
         for step in tqdm(range(1,steps+1), desc=case["name"], leave=False, disable=not progress):
-            mu_hat = linear*phi_hat + torch.fft.fft2(case["b"]*phi.pow(3)+case["lam"]*grad2(phi),norm="ortho")
-            next_hat = phi_hat-RUN["dt"]*case["mobility"]*q2*mu_hat
-            if ep_defined:
-                noise = torch.randn((n,n),generator=rng,device=DEVICE,dtype=dtype)
-                next_hat += noise_scale*torch.fft.fft2(noise,norm="ortho")
-            next_hat[0,0] = zero_coefficient
-            new = torch.fft.ifft2(next_hat,norm="ortho").real
+            normal = torch.randn((2,n,n),generator=rng,device=DEVICE,dtype=dtype)
+            new = stepper(phi,normal)
+            next_hat = torch.fft.fft2(new,norm="ortho")
             if ep_defined:
                 channels = -potentials((phi+new)/2,(phi_hat+next_hat)/2)*(new-phi)/case["D"]
                 ds = torch.cat((channels,channels.sum(0,keepdim=True)),dim=0)
@@ -482,7 +473,7 @@ if __name__ == "__main__":
             initialization=INITIALIZATION, bvp=BVP, root=ROOT, mode_max=MODE_MAX,
             remove_zero_mode=REMOVE_ZERO_MODE, initial_sha256=hashlib.sha256(initial.tobytes()).hexdigest(),
             multiplier_sha256=hashlib.sha256(kernel_multiplier(case).tobytes()).hexdigest(),
-            solver_sha256=hashlib.sha256(marshal.dumps(evolve.__wrapped__.__code__)).hexdigest(),
+            solver_sha256=hashlib.sha256(marshal.dumps(evolve.__wrapped__.__code__)+b"".join((LRAMB_ROOT / "lramb" / file).read_bytes() for file in ("stencils.py","torch_stencils.py"))).hexdigest(),
             device=str(DEVICE), torch_version=torch.__version__)
         return description, hashlib.sha256(json.dumps(description,sort_keys=True).encode()).hexdigest()[:20]
 

@@ -77,6 +77,8 @@ def run(args):
     LRAMB_ROOT = (args.lramb_root.expanduser().resolve() if args.lramb_root else KNEEP_ROOT.parent/"LRAMB")
     sys.path.insert(0, str(LRAMB_ROOT))
     from lramb.model import Parameters, KernelSpec, ActiveModelB
+    from lramb import stencils as stencil_ops
+    from lramb.torch_stencils import from_model
 
     torch.set_num_threads(args.cpu_threads)
     plt.rcParams.update({"figure.dpi": 110, "axes.grid": True, "grid.alpha": 0.25,
@@ -93,7 +95,7 @@ def run(args):
 
     GRID = dict(n=64, dx=1.0)
     BASE = dict(a=-0.25, b=0.25, kappa=4.0, mobility=1.0,
-                g=0.0, ell=1.0, lam=10.0, D=0.1, radius=16.0)
+                g=0.0, ell=1.0, lam=10.0, zeta=0.0, D=0.1, radius=16.0)
     PHYS = dict(**GRID, **{k:v for k,v in BASE.items() if k != "radius"},
                 dt=0.001, kernel="poisson", alpha=1.0)
     # Matches Corr_AMB2D_ShellForce: a changes sign between conventions; g=0.
@@ -228,22 +230,19 @@ def run(args):
         q2_init = qx*qx+qy*qy
         multiplier = KernelSpec("poisson",ell=BASE["ell"]).multiplier(np.sqrt(q2_init))
 
-        def chemical_potential(phi, g, lam):
-            lap = sum(np.roll(phi,1,ax)+np.roll(phi,-1,ax)-2*phi
-                      for ax in (-2,-1))/dx**2
-            grad2 = sum((np.roll(phi,1,ax)-phi)**2+(np.roll(phi,-1,ax)-phi)**2
-                        for ax in (-2,-1))/(2*dx**2)
-            convolution = np.fft.ifft2(multiplier*np.fft.fft2(phi)).real
-            return a*phi+b*phi**3-kappa*lap+g*convolution+lam*grad2
+        def chemical_potential(phi, g, lam, zeta=None):
+            convolution = np.fft.ifft2(multiplier*np.fft.fft2(phi)).real if g else 0.
+            return (a*phi+b*phi**3-kappa*stencil_ops.laplacian9(phi,dx)+g*convolution
+                    +stencil_ops.effective_active(phi,dx,lam,BASE.get("zeta",0.) if zeta is None else zeta))
 
         continuation = []
         if INITIALIZATION == "periodic_stationary":
-            previous_mu = float(chemical_potential(field,0.,0.).mean())
+            previous_mu = float(chemical_potential(field,0.,0.,0.).mean())
             for fraction in np.linspace(0.,1.,ROOT["continuation_steps"]+1):
                 g,lam = fraction*BASE["g"],fraction*BASE["lam"]
                 def periodic_equation(z):
                     phi = z[:-1].reshape(n,n)
-                    return np.r_[(chemical_potential(phi,g,lam)-z[-1]).ravel(),
+                    return np.r_[(stencil_ops.stationary_residual(phi, local_field, chemical_potential(phi,g,lam,fraction*BASE.get("zeta",0.)))+z[-1]).ravel(),
                                  n*n*(phi.mean()-target_mean)]
                 solved = root(periodic_equation,np.r_[field.ravel(),previous_mu],method="krylov",
                               options=dict(fatol=ROOT["tol"],maxiter=ROOT["maxiter"]))
@@ -262,7 +261,7 @@ def run(args):
         initial_info = dict(radial=radial_info,continuation=continuation,
                             initialization=INITIALIZATION,target_mean=target_mean,
                             actual_mean=float(field.mean()),mass_offset=float(field.mean()-target_mean),
-                            mu_spread=float(np.max(abs(mu-mu.mean()))),
+                            mu_spread=float(np.max(abs(mu-stencil_ops.null_projection(mu)))),
                             centre=float(field[n//2,n//2]),exterior=float(field[0,0]))
         print("Initial field diagnostics:", initial_info | {"continuation":"see above","radial":"see above"})
         if field[n//2,n//2]<=0 or field[0,0]>=0:
@@ -289,13 +288,13 @@ def run(args):
     def signature(value):
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
-    DATA_META = dict(format="single-demo-circle-bvp-batched-em-midpoint-v2", physics=PHYS,
+    DATA_META = dict(format="single-demo-tjhung-realspace-effective-ep-v3", physics=PHYS,
                      data=DATA, master_seed=SEED, device_type=DEVICE.type,
                      initialization=dict(kind=INITIALIZATION, radius=BASE["radius"], bvp=BVP, root=ROOT,
                          field_sha256=hashlib.sha256(INITIAL_FIELD.tobytes()).hexdigest()),
                      torch_version=str(torch.__version__),
                      operator_source_sha256=hashlib.sha256(
-                         (LRAMB_ROOT / "lramb" / "model.py").read_bytes()).hexdigest())
+                         b"".join((LRAMB_ROOT / "lramb" / file).read_bytes() for file in ("model.py","stencils.py","torch_stencils.py"))).hexdigest())
     DATA_ID = signature(DATA_META)
     DATA_DIR = OUTPUT_ROOT / ("data_" + DATA_ID[:12])
     FIT_META = dict(format="single-demo-shellforce-v1", data_signature=DATA_ID,
@@ -329,17 +328,17 @@ def run(args):
 
     # ---- Euler-Maruyama and midpoint medium entropy ----
     parameters = Parameters(**{k: PHYS[k] for k in
-        ("n", "dx", "dt", "a", "b", "kappa", "lam", "mobility", "D", "mean")},
+        ("n", "dx", "dt", "a", "b", "kappa", "lam", "zeta", "mobility", "D", "mean")},
         seed=SEED)
     operator = ActiveModelB(parameters, KernelSpec(PHYS["kernel"],
         strength=PHYS["g"], ell=PHYS["ell"], alpha=PHYS["alpha"]))
     kw = dict(device=DEVICE, dtype=torch.float64)
-    Q2 = torch.as_tensor(operator.q2[:, :n//2+1], **kw)
+    Q2 = torch.as_tensor(operator.stiffness_q2[:, :n//2+1], **kw)
     K = torch.as_tensor(operator.K[:, :n//2+1], **kw)
-    LINEAR = torch.as_tensor(operator.linear_mu[:, :n//2+1], **kw)
-    NOISE = torch.as_tensor(operator.noise_scale[:, :n//2+1], **kw)
     MULT = torch.full((n//2+1,), 2.0, **kw)
     MULT[0] = MULT[-1] = 1.0
+
+    stepper = from_model(operator, DEVICE, torch.float64)
 
     # Solve once, broadcast the same reference circle to every ensemble member.
     INITIAL_TENSOR = torch.as_tensor(INITIAL_FIELD, **kw)
@@ -348,38 +347,15 @@ def run(args):
         return INITIAL_TENSOR[None].expand(count, n, n).clone()
 
     def neighbours(phi):
-        left, right = torch.roll(phi, 1, -2), torch.roll(phi, -1, -2)
-        down, up = torch.roll(phi, 1, -1), torch.roll(phi, -1, -1)
-        lap = (left + right + down + up - 4*phi) / dV
-        grad2 = ((left-phi).square() + (right-phi).square()
-                 + (down-phi).square() + (up-phi).square()) / (2*dV)
-        return lap, grad2
+        return stepper.laplacian(phi), stepper.grad_squared(phi)
 
     def advance(phi, ph, rng):
-        _, grad2 = neighbours(phi)
-        nonlinear = PHYS["b"] * phi.pow(3) + PHYS["lam"] * grad2
-        normal = torch.randn(phi.shape, generator=rng, **kw)
-        new_hat = ph - dt * PHYS["mobility"] * Q2 * (
-            LINEAR * ph + torch.fft.rfft2(nonlinear, norm="ortho"))
-        new_hat = new_hat + NOISE * torch.fft.rfft2(normal, norm="ortho")
-        # Enforce real-field symmetry at the two rFFT boundary columns.
-        for col in (0, -1):
-            value = new_hat[..., col]
-            new_hat[..., col] = (value + torch.roll(value.flip(-1), 1, -1).conj()) / 2
-        new_hat[..., 0, 0] = ph[..., 0, 0]
-        new = torch.fft.irfft2(new_hat, s=(n, n), norm="ortho")
-        canonical = torch.fft.rfft2(new, norm="ortho")
-        return new, canonical
+        normal = torch.randn((*phi.shape[:-2],2,*phi.shape[-2:]), generator=rng, **kw)
+        new = stepper(phi, normal)
+        return new, torch.fft.rfft2(new, norm="ortho")
 
     def midpoint_entropy(old, new, old_hat, new_hat):
-        mid = (old + new) / 2
-        lap, grad2 = neighbours(mid)
-        local = PHYS["a"]*mid + PHYS["b"]*mid.pow(3) - PHYS["kappa"]*lap
-        nonlocal_mu = PHYS["g"] * torch.fft.irfft2(
-            K * (old_hat + new_hat) / 2, s=(n, n), norm="ortho")
-        mu = torch.stack((local, nonlocal_mu, PHYS["lam"]*grad2), dim=1)
-        # Integrated entropy density, NOT a rate: [B, 3, H, W].
-        return -mu * (new-old)[:, None] / PHYS["D"]
+        return stepper.entropy(old, new)[0]
 
     def diagnostics(phi, ph):
         power = ph.abs().square() * MULT
@@ -397,7 +373,7 @@ def run(args):
 
     def save_active_metadata(source):
         metadata = dict(schema=1, data_signature=DATA_ID, source=source,
-                        quantity="-lambda*grad(phi_mid)^2*dphi/D; density increment",
+                        quantity="-effective_active_potential(phi_mid)*dphi/D; Tjhung field-level EP density increment",
                         system_entropy=False)
         temporary = ACTIVE_META_PATH.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -536,8 +512,7 @@ def run(args):
                     last = min(first+128, test_video.shape[1]-1)
                     old = torch.as_tensor(np.array(test_video[member, first:last], dtype=np.float64), **kw)
                     new = torch.as_tensor(np.array(test_video[member, first+1:last+1], dtype=np.float64), **kw)
-                    _, grad2 = neighbours((old+new)/2)
-                    active_maps[member, first:last] = (-PHYS["lam"]*grad2*(new-old)/PHYS["D"]).cpu().numpy()
+                    active_maps[member, first:last] = (-stepper.effective_active((old+new)/2)*(new-old)/PHYS["D"]).cpu().numpy()
         active_maps.flush()
         del active_maps
         temporary.replace(ACTIVE_PATH)
@@ -1042,7 +1017,7 @@ def run(args):
     active_rate = float(a_ref.sum()/duration)
     active_ratio = pred_rate/active_rate if abs(active_rate)>1e-12 else float("nan")
     print(f"Active-only mean rate={active_rate:.6g}, pred/active={active_ratio:.5g}")
-    print("Active-only = -integral mu_A o dphi / D; this is not a system-entropy correction.")
+    print("Active-only = -integral mu_A_eff o dphi / D (D8 mobility); no system-entropy correction.")
     print("Both physical references exclude system entropy; KNEEP uses a stationary path gauge.")
 
     # ---- Time-averaged maps ----

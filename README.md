@@ -24,20 +24,38 @@ Results are saved under `KNEEP/results/saou_perform/` and
 Both plot commands accept `--results-dir PATH` and `--dpi 300`.
 Move previous results aside before training with changed experiment settings.
 
+## LRAMB numerical implementation
+
+All LRAMB datasets, single-run demos/scripts, and Poisson sanity paths use
+the sibling LRAMB package's Tjhung real-space stencils: Lap9 conservative
+stiffness, eighth-order centered passive/noise currents, and isotropic 3x3
+active currents. Local time stepping uses Euler?Maruyama and Torch
+convolutions (or SciPy on the NumPy backend). FFTs serve long-range kernels
+and diagnostics, including the effective active EP potential. See
+[LRAMB numerical details](../LRAMB/README.md#real-space-amb-discretization).
+
+`zeta` defaults to zero; it can enable the extra AMB+ current. On even grids,
+the centered derivatives conserve the mean and three checkerboard modes.
+Stationary initialization and active EP pseudoinverses handle all four.
+The active EP map uses the zero-null-mode pseudoinverse convention.
+The generator revision and source fingerprints have changed: older
+trajectories/checkpoints belong to the former discretization and are not
+reused under the new signature. Regenerate data before retraining.
+
 ## Poisson circular-cluster sanity notebook
 
 Open [demos/poisson_sanity.ipynb](demos/poisson_sanity.ipynb) for editable
-32x32 circular-droplet experiments, with current defaults g=0.3 and ell=1. Initialization
-solves a radial local-passive boundary-value problem with centre/exterior
-Neumann conditions and fixed disk mass, then by default continues to a
-stationary solution of the actual periodic Poisson+active lattice equation.
-The chemical potential is solved with the field; curved-droplet bulk values
-are not artificially pinned to +/-1. Failed initialization is reported separately
-from dynamical instability, with no tanh fallback.
+64x64 circular-droplet experiments matching the Corr_AMB2D_ShellForce setup:
+`a=-0.25, b=0.25, kappa=4, M=1, lambda=10, zeta=0, D=0.1, g=0, ell=1`,
+with radius 16 and `dt=0.001`. The default initialization is the analytic
+tanh profile. `local_bvp` solves a radial local-passive boundary-value problem;
+`periodic_stationary` continues that field to zero drift of the periodic
+Poisson+active stencil equation, preserving all D8 conserved modes.
+Failed BVP/root initialization is reported with no silent fallback.
 
 Each condition evolves one field using float64 Euler-Maruyama and conserved
 noise on CUDA or CPU. `RUN["burn_in"]` sets the equilibration time, followed by
-`RUN["duration"]` of production. Both default to 160 physical time units.
+`RUN["duration"]` of production. Defaults are 10 and 4.999 physical time units, respectively.
 Editable cells show x/y averaged-profile heatmaps, axial Fourier mode powers
 and amplitudes, field snapshots and a field/profile movie. Steady-state
 diagnostics cover initialization, the entire burn-in, and production, with
@@ -153,7 +171,7 @@ iteration. `training_loss.png` is refreshed at each recorded evaluation.
 Both the single-run notebook and script overlay the full medium reference,
 the active-chemical-potential-only reference, and KNEEP prediction in cumulative
 and window-averaged EP plots. The active contribution uses
-`mu_A=lambda*|grad(phi_mid)|^2` in `-mu_A*dphi/D`, with the same midpoint and
+`mu_A_eff=L8^+(active_drift/M)` in `-mu_A_eff*dphi/D`, with the same midpoint and
 spatial integration as full medium. Neither physical reference adds system
 entropy. The time-averaged map figure has three panels with one colour scale.
 `evaluation.npz` also saves `active_increment` and `active_mean_density`.

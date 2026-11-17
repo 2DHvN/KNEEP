@@ -24,7 +24,7 @@ import torch
 
 
 SCHEMA_VERSION = 2
-GENERATOR_REVISION = "canonical-fourier-v5-buffered-cuda-graph"
+GENERATOR_REVISION = "tjhung-real-space-v1-effective-active-ep"
 CHANNEL_NAMES = ("local conservative", "kernel conservative", "local active")
 SPLITS = ("train", "validation", "test")
 _SEED_OFFSETS = {"train": 0, "validation": 100_000, "test": 200_000}
@@ -47,6 +47,7 @@ class DatasetConfig:
     b: float = 1.0
     kappa: float = 1.0
     lam: float = 0.8
+    zeta: float = 0.0
     mobility: float = 1.0
     D: float = 0.05
     mean: float = -0.2
@@ -99,7 +100,7 @@ class DatasetConfig:
             raise ValueError("production_steps must be divisible by sample_every * blocks")
         if self.production_steps // (self.sample_every * self.blocks) < 2:
             raise ValueError("at least two saved EP intervals per time block are needed")
-        for name in ("dx", "dt", "a", "b", "kappa", "lam", "mobility", "D", "mean", "strength"):
+        for name in ("dx", "dt", "a", "b", "kappa", "lam", "zeta", "mobility", "D", "mean", "strength"):
             if not math.isfinite(getattr(self, name)):
                 raise ValueError(f"{name} must be finite")
         if min(self.dx, self.dt, self.b, self.mobility, self.D) <= 0 or self.kappa < 0:
@@ -488,14 +489,8 @@ def _run_numpy(model, cfg: DatasetConfig, multipliers: np.ndarray, *,
     max_fourier_state_error = 0.0
 
     def advance():
-        nonlocal max_fourier_state_error
-        new, propagated = model.step(phi, ph)
-        # The real field is authoritative. Do not carry a spectrum that an
-        # external solver's inverse FFT may have projected differently.
-        canonical = np.fft.fft2(new, norm="ortho")
-        max_fourier_state_error = max(
-            max_fourier_state_error, float(np.max(np.abs(propagated - canonical))))
-        return new, canonical
+        # The Tjhung step constructs its spectrum from the updated real field.
+        return model.step(phi, ph)
 
     for step in range(cfg.burn_steps):
         phi, ph = advance()
@@ -562,7 +557,8 @@ def _run_numpy(model, cfg: DatasetConfig, multipliers: np.ndarray, *,
 def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, *,
                capture_movie: bool = False) -> dict[str, Any]:
     # Reuse the actual LRAMB solver kernels, with float64 dynamics and entropy.
-    from lramb.torch_backend import _step, _midpoint
+    from lramb.torch_stencils import from_model
+    stepper = from_model(model, device, torch.float64)
 
     initial = initial_field(model, cfg)
     initial_hash = _hash_array(initial)
@@ -570,10 +566,8 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
     phi = torch.as_tensor(initial, **kw)
     ph = torch.fft.rfft2(phi, norm="ortho")
     nh = cfg.n // 2 + 1
-    q2 = torch.as_tensor(model.q2[:, :nh], **kw)
+    q2 = torch.as_tensor(model.stiffness_q2[:, :nh], **kw)
     kernel = torch.as_tensor(model.K[:, :nh], **kw)
-    linear = torch.as_tensor(model.linear_mu[:, :nh], **kw)
-    noise_scale = torch.as_tensor(model.noise_scale[:, :nh], **kw)
     shell = torch.as_tensor(multipliers[:, :, :nh], **kw)
     multiplicity = torch.full((nh,), 2.0, **kw)
     multiplicity[0] = multiplicity[-1] = 1.0
@@ -599,15 +593,10 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
     movie_entropy = torch.zeros((cfg.n, cfg.n), **kw) if capture_movie else None
 
     def advance():
-        nonlocal max_fourier_state_error
-        normal = torch.randn(phi.shape, generator=rng, **kw)
-        new, propagated = _step(phi, ph, normal, linear, q2, noise_scale,
-                                cfg.dt * cfg.mobility, cfg.b, cfg.lam, cfg.dx)
-        # This generator enforces field/spectrum consistency independently of
-        # the imported LRAMB version and the FFT backend's inverse projection.
+        normal = torch.randn((2, *phi.shape), generator=rng, **kw)
+        new = stepper(phi, normal)
+        # Canonical by construction; no redundant transform for comparison.
         canonical = torch.fft.rfft2(new, norm="ortho")
-        max_fourier_state_error = torch.maximum(
-            max_fourier_state_error, (propagated - canonical).abs().max())
         return new, canonical
 
     def record(index):
@@ -628,9 +617,7 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
         if cfg.cuda_graph_steps:
             from models.lramb_cuda import graph_burn_in
             phi, ph, graph_error, completed_burn = graph_burn_in(
-                _step, phi, ph, linear, q2, noise_scale, rng,
-                dt_mobility=cfg.dt * cfg.mobility, b=cfg.b, lam=cfg.lam,
-                dx=cfg.dx, steps=cfg.burn_steps, chunk_steps=cfg.cuda_graph_steps)
+                stepper, phi, ph, rng, steps=cfg.burn_steps, chunk_steps=cfg.cuda_graph_steps)
             max_fourier_state_error = torch.maximum(max_fourier_state_error, graph_error)
         for step in range(completed_burn, cfg.burn_steps):
             phi, ph = advance()
@@ -639,8 +626,7 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
         previous_shell_energy = record(0)
         for step in range(1, cfg.production_steps + 1):
             new, new_hat = advance()
-            ds, _ = _midpoint(phi, new, ph, new_hat, kernel, cfg.a, cfg.b,
-                              cfg.kappa, cfg.lam, cfg.strength, cfg.dx, cfg.D)
+            ds, _ = stepper.entropy(phi, new)
             ep_maps += ds
             if capture_movie:
                 movie_entropy += model.dV * ds.sum(dim=0)
@@ -704,6 +690,7 @@ def _check_trajectory_reference(trajectory, *, ell, split, seed, backend):
 
 def _generation_source(root: Path) -> dict[str, str]:
     return dict(lramb_root=str(root),
+                stencil_sha256=sha256((root / "lramb/stencils.py").read_bytes()+(root / "lramb/torch_stencils.py").read_bytes()).hexdigest(),
                 lramb_model_sha256=sha256((root / "lramb/model.py").read_bytes()).hexdigest(),
                 lramb_torch_backend_sha256=sha256((root / "lramb/torch_backend.py").read_bytes()).hexdigest(),
                 cuda_graph_sha256=sha256(Path(__file__).with_name("lramb_cuda.py").read_bytes()).hexdigest(),
@@ -831,7 +818,7 @@ def generate_trajectory_task(task: dict[str, Any], *, device: str = "cpu",
         raise ValueError("Solver/generator source changed after preparation; prepare again")
     effective = replace(config, strength=condition["strength"])
     parameters = lramb.Parameters(**{key: getattr(effective, key) for key in
-        ("n", "dx", "dt", "a", "b", "kappa", "lam", "mobility", "D", "mean")},
+        ("n", "dx", "dt", "a", "b", "kappa", "lam", "zeta", "mobility", "D", "mean")},
         seed=task["seed"])
     kernel = lramb.KernelSpec("poisson", strength=condition["strength"], ell=condition["solver_ell"])
     model = lramb.ActiveModelB(parameters, kernel,

@@ -9,11 +9,9 @@ import torch
 
 
 class _BurnGraph:
-    def __init__(self, step_fn, phi, ph, linear, q2, noise_scale,
-                 dt_mobility, b, lam, dx, chunk_steps):
+    def __init__(self, stepper, phi, ph, chunk_steps):
         self.phi, self.ph = phi.clone(), ph.clone()
-        self.linear, self.q2 = linear.clone(), q2.clone()
-        self.noise_scale = noise_scale.clone()
+        self.stepper = stepper
         self.error = torch.zeros((), dtype=phi.dtype, device=phi.device)
         self.bad = torch.zeros((), dtype=torch.bool, device=phi.device)
         self.rng = torch.Generator(device=phi.device).manual_seed(0)
@@ -21,14 +19,11 @@ class _BurnGraph:
 
         def chunk():
             for _ in range(chunk_steps):
-                normal = torch.randn(self.phi.shape, dtype=phi.dtype,
+                normal = torch.randn((*self.phi.shape[:-2],2,*self.phi.shape[-2:]), dtype=phi.dtype,
                                      device=phi.device, generator=self.rng)
-                new, propagated = step_fn(
-                    self.phi, self.ph, normal, self.linear, self.q2,
-                    self.noise_scale, dt_mobility, b, lam, dx)
+                new = self.stepper(self.phi, normal)
                 canonical = torch.fft.rfft2(new, norm="ortho")
-                self.error.copy_(torch.maximum(
-                    self.error, (propagated - canonical).abs().max()))
+
                 self.bad.logical_or_(~torch.isfinite(new).all() | (new.abs().max() > 30))
                 # Stable input addresses are essential for subsequent replays.
                 self.phi.copy_(new)
@@ -56,14 +51,12 @@ class _BurnGraph:
             chunk()
         torch.cuda.current_stream(phi.device).wait_stream(stream)
 
-    def run(self, phi, ph, linear, q2, noise_scale, rng, chunks):
+    def run(self, phi, ph, stepper, rng, chunks):
         # All state manipulation is OUTSIDE capture. Warmup/capture must not
         # consume the trajectory's random sequence or change its initial field.
         self.phi.copy_(phi)
         self.ph.copy_(ph)
-        self.linear.copy_(linear)
-        self.q2.copy_(q2)
-        self.noise_scale.copy_(noise_scale)
+        self.stepper.kernel.copy_(stepper.kernel)
         self.error.zero_()
         self.bad.zero_()
         self.rng.set_state(rng.get_state())
@@ -80,8 +73,7 @@ _cached_key = None
 _cached_graph = None
 
 
-def graph_burn_in(step_fn, phi, ph, linear, q2, noise_scale, rng, *,
-                  dt_mobility, b, lam, dx, steps, chunk_steps):
+def graph_burn_in(stepper, phi, ph, rng, *, steps, chunk_steps):
     """Run complete chunks, returning (field, spectrum, max error, steps done).
 
     The caller executes any remaining steps eagerly with the advanced RNG state.
@@ -94,16 +86,16 @@ def graph_burn_in(step_fn, phi, ph, linear, q2, noise_scale, rng, *,
     chunks = steps // chunk_steps
     if not chunks:
         return phi, ph, torch.zeros((), dtype=phi.dtype, device=phi.device), 0
-    key = (str(phi.device), tuple(phi.shape), phi.dtype, dt_mobility, b, lam,
-           dx, chunk_steps, id(step_fn))
+    key = (str(phi.device), tuple(phi.shape), phi.dtype, chunk_steps,
+           stepper.a, stepper.b, stepper.kappa, stepper.lam, stepper.zeta,
+           stepper.dx, stepper.dt, stepper.mobility, stepper.D, stepper.strength)
     if key != _cached_key:
         _cached_graph = None
         _cached_key = None
         with torch.cuda.device(phi.device):
-            graph = _BurnGraph(step_fn, phi, ph, linear, q2, noise_scale,
-                               dt_mobility, b, lam, dx, chunk_steps)
+            graph = _BurnGraph(stepper, phi, ph, chunk_steps)
         _cached_graph, _cached_key = graph, key
     with torch.cuda.device(phi.device):
         field, spectrum, error = _cached_graph.run(
-            phi, ph, linear, q2, noise_scale, rng, chunks)
+            phi, ph, stepper, rng, chunks)
     return field, spectrum, error, chunks * chunk_steps
