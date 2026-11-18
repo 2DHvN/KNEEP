@@ -24,7 +24,7 @@ import torch
 
 
 SCHEMA_VERSION = 2
-GENERATOR_REVISION = "tjhung-real-space-v1-effective-active-ep"
+GENERATOR_REVISION = "tjhung-real-space-v2-joint-burn"
 CHANNEL_NAMES = ("local conservative", "kernel conservative", "local active")
 SPLITS = ("train", "validation", "test")
 _SEED_OFFSETS = {"train": 0, "validation": 100_000, "test": 200_000}
@@ -482,9 +482,12 @@ def _movie_layout(cfg: DatasetConfig) -> dict[str, np.ndarray]:
 
 
 def _run_numpy(model, cfg: DatasetConfig, multipliers: np.ndarray, *,
-               capture_movie: bool = False) -> dict[str, Any]:
-    phi = initial_field(model, cfg)
-    initial_hash = _hash_array(phi)
+               capture_movie: bool = False, burn_state=None,
+               original_initial_hash: str | None = None) -> dict[str, Any]:
+    phi = initial_field(model, cfg) if burn_state is None else np.array(burn_state, dtype=np.float64, copy=True)
+    initial_hash = _hash_array(phi) if original_initial_hash is None else original_initial_hash
+    if burn_state is not None:
+        model.rng = np.random.default_rng(_stream_seed(model.p.seed, "production"))
     ph = np.fft.fft2(phi, norm="ortho")
     max_fourier_state_error = 0.0
 
@@ -492,7 +495,7 @@ def _run_numpy(model, cfg: DatasetConfig, multipliers: np.ndarray, *,
         # The Tjhung step constructs its spectrum from the updated real field.
         return model.step(phi, ph)
 
-    for step in range(cfg.burn_steps):
+    for step in range(cfg.burn_steps if burn_state is None else 0):
         phi, ph = advance()
         if step % 100 == 0 and (not np.isfinite(phi).all() or np.max(np.abs(phi)) > 30):
             raise FloatingPointError("Unstable burn-in trajectory; reduce dt")
@@ -555,13 +558,14 @@ def _run_numpy(model, cfg: DatasetConfig, multipliers: np.ndarray, *,
 
 
 def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, *,
-               capture_movie: bool = False) -> dict[str, Any]:
+               capture_movie: bool = False, burn_state=None,
+               original_initial_hash: str | None = None) -> dict[str, Any]:
     # Reuse the actual LRAMB solver kernels, with float64 dynamics and entropy.
     from lramb.torch_stencils import from_model
     stepper = from_model(model, device, torch.float64)
 
-    initial = initial_field(model, cfg)
-    initial_hash = _hash_array(initial)
+    initial = initial_field(model, cfg) if burn_state is None else np.array(burn_state, dtype=np.float64, copy=True)
+    initial_hash = _hash_array(initial) if original_initial_hash is None else original_initial_hash
     kw = dict(dtype=torch.float64, device=device)
     phi = torch.as_tensor(initial, **kw)
     ph = torch.fft.rfft2(phi, norm="ortho")
@@ -571,7 +575,8 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
     shell = torch.as_tensor(multipliers[:, :, :nh], **kw)
     multiplicity = torch.full((nh,), 2.0, **kw)
     multiplicity[0] = multiplicity[-1] = 1.0
-    rng = torch.Generator(device=device).manual_seed(model.p.seed)
+    rng = torch.Generator(device=device).manual_seed(
+        model.p.seed if burn_state is None else _stream_seed(model.p.seed, "production"))
     count = cfg.production_steps // cfg.sample_every
     video = torch.empty((count + 1, 1, cfg.n, cfg.n), dtype=torch.float32)
     # Keep a bounded staging buffer on device instead of synchronizing CUDA
@@ -613,13 +618,14 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
         return model.dV * cfg.strength / 2 * (shell * power).sum(dim=(1, 2))
 
     with torch.inference_mode():
+        burn_steps = cfg.burn_steps if burn_state is None else 0
         completed_burn = 0
-        if cfg.cuda_graph_steps:
+        if cfg.cuda_graph_steps and burn_steps:
             from models.lramb_cuda import graph_burn_in
             phi, ph, graph_error, completed_burn = graph_burn_in(
-                stepper, phi, ph, rng, steps=cfg.burn_steps, chunk_steps=cfg.cuda_graph_steps)
+                stepper, phi, ph, rng, steps=burn_steps, chunk_steps=cfg.cuda_graph_steps)
             max_fourier_state_error = torch.maximum(max_fourier_state_error, graph_error)
-        for step in range(completed_burn, cfg.burn_steps):
+        for step in range(completed_burn, burn_steps):
             phi, ph = advance()
             if step % 100 == 0 and (not torch.isfinite(phi).all() or phi.abs().max() > 30):
                 raise FloatingPointError("Unstable burn-in trajectory; reduce dt")
@@ -702,8 +708,9 @@ def prepare_generation(config: DatasetConfig, output_dir: str | Path,
                        force: bool = False) -> dict[str, Any]:
     """Prepare a manifest once, before independent worker processes are started.
 
-    Returned ``trajectory_tasks`` are JSON-serializable. Each task writes only
-    its own atomic trajectory shard; workers never update shared manifest JSON.
+    First execute one ``burn_tasks`` entry per condition. After all burns finish,
+    dispatch the JSON-serializable ``trajectory_tasks`` for production. Each task
+    writes its own atomic file; workers never update shared manifest JSON.
     CUDA device indices do not enter the dataset signature, allowing the same
     prepared tasks to be distributed over cuda:0, cuda:1, and so on.
     """
@@ -734,15 +741,19 @@ def prepare_generation(config: DatasetConfig, output_dir: str | Path,
                 for split in SPLITS},
         train_pairs_per_condition=config.train_pairs,
         train_video_bytes_per_condition=config.train_trajectories * frames * config.n ** 2 * 4,
-        conditions=[], trajectory_tasks=[])
+        conditions=[], burn_tasks=[], trajectory_tasks=[])
     for condition in dataset_conditions(config):
         cid = condition["condition_id"]
         entry = dict(condition, files={split: f"data/{cid}/{split}.json" for split in SPLITS},
-                     shards={split: [] for split in SPLITS})
+                     shards={split: [] for split in SPLITS}, burn_file=f"data/{cid}/burn_state.pt")
+        manifest["burn_tasks"].append(dict(output_dir=str(directory), signature=signature,
+            condition_id=cid, force=bool(force)))
+        burn_index = 0
         for split in SPLITS:
             for index, seed in enumerate(config.seeds(split)):
                 file = f"data/{cid}/{split}/trajectory_{index:05d}_seed_{seed}.pt"
                 shard = dict(file=file, trajectory_index=index, seed=seed,
+                             burn_index=burn_index,
                              frames=frames, pairs=frames - 1,
                              has_movie=split == "test" and index < config.movie_trajectories)
                 entry["shards"][split].append(shard)
@@ -750,6 +761,7 @@ def prepare_generation(config: DatasetConfig, output_dir: str | Path,
                     signature=signature, condition_id=cid, ell=condition["ell"],
                     strength=condition["strength"],
                     split=split, force=bool(force)))
+                burn_index += 1
         manifest["conditions"].append(entry)
     _atomic_json(manifest, directory / "dataset.json")
     return manifest
@@ -772,15 +784,134 @@ def _trajectory_metadata(manifest, condition, split, seeds, multiplier_hash, bac
         interpretation="medium entropy excludes stochastic system entropy; learned branch maps need not match this gauge",
         movie_window_steps=config.movie_window_steps,
         movie_units="per-site medium EP per physical time, including dx**2",
+        burn_protocol="one batch per condition, train+validation+test; separate production streams",
+        random_stream="SHA256-derived joint burn seed and per-trajectory production seeds",
         kernel_multiplier_sha256=multiplier_hash)
+
+
+def _stream_seed(seed: int, phase: str) -> int:
+    value = sha256(f"lramb-joint-burn-v1:{seed}:{phase}".encode()).digest()
+    return int.from_bytes(value[:8], "little") % (2**63 - 1)
+
+
+def _condition_model(lramb, cfg, condition, seed):
+    parameters = lramb.Parameters(**{key: getattr(cfg, key) for key in
+        ("n", "dx", "dt", "a", "b", "kappa", "lam", "zeta", "mobility", "D", "mean")}, seed=seed)
+    kernel = lramb.KernelSpec("poisson", strength=condition["strength"], ell=condition["solver_ell"])
+    return lramb.ActiveModelB(parameters, kernel,
+        multiplier=np.zeros((cfg.n, cfg.n)) if condition["is_control"] else None)
+
+
+@torch.inference_mode()
+def generate_burnin_task(task: dict[str, Any], *, device: str = "cpu",
+                         progress: bool = True) -> dict[str, Any]:
+    """Burn all split members together and atomically save their terminal fields.
+
+    Schedule one task per physical condition before any production tasks.
+    Independent batch noise is shared across conditions for matched comparisons.
+    Only current fields are resident; no burn-in movie is allocated.
+    """
+    directory = Path(task["output_dir"])
+    manifest = read_manifest(directory)
+    if manifest["signature"] != task["signature"]:
+        raise ValueError("Burn task signature no longer matches dataset.json")
+    condition = next(item for item in manifest["conditions"] if item["condition_id"] == task["condition_id"])
+    path = directory / condition["burn_file"]
+    backend = _backend(device)
+    if dict(backend, device=torch.device(backend["device"]).type) != manifest["backend"]:
+        raise ValueError("Burn worker backend differs from the prepared dataset backend")
+    if path.is_file() and not task.get("force", False):
+        cached = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        if cached.get("signature") != manifest["signature"] or cached.get("condition_id") != task["condition_id"]:
+            raise ValueError("Burn checkpoint has mismatching metadata")
+        if progress:
+            print(f"{task['condition_id']}: reusing joint burn-in checkpoint", flush=True)
+        return dict(condition_id=task["condition_id"], cached=True)
+    cfg = DatasetConfig.from_dict(manifest["config"])
+    root, lramb = _lramb_module(manifest["source"]["lramb_root"])
+    if _generation_source(root) != manifest["source"]:
+        raise ValueError("Solver/generator source changed after preparation; prepare again")
+    model = _condition_model(lramb, cfg, condition, cfg.base_seed)
+    seeds = [seed for split in SPLITS for seed in cfg.seeds(split)]
+    fields, hashes = [], []
+    for seed in seeds:
+        model.rng = np.random.default_rng(seed)
+        field = initial_field(model, cfg)
+        fields.append(field)
+        hashes.append(_hash_array(field))
+    initial = np.stack(fields)
+    del fields
+    burn_seed = _stream_seed(cfg.base_seed, "burn")
+    started = time.perf_counter()
+    if progress:
+        print(f"{task['condition_id']}: joint burn-in, batch={len(seeds)} "
+              f"(train+validation+test), steps={cfg.burn_steps:,}, device={device}", flush=True)
+    completed = 0
+    if backend["name"] == "torch":
+        from lramb.torch_stencils import from_model
+        stepper = from_model(model, device, torch.float64)
+        phi = torch.as_tensor(initial, device=device, dtype=torch.float64)
+        target_mass = phi.mean((-2,-1)).clone()
+        rng = torch.Generator(device=device).manual_seed(burn_seed)
+        if cfg.cuda_graph_steps and cfg.burn_steps:
+            from models.lramb_cuda import graph_burn_in
+            phi, _, _, completed = graph_burn_in(stepper, phi,
+                torch.fft.rfft2(phi, norm="ortho"), rng,
+                steps=cfg.burn_steps, chunk_steps=cfg.cuda_graph_steps)
+    else:
+        from lramb import stencils
+        phi = initial.copy()
+        target_mass = phi.mean(axis=(-2,-1))
+        rng = np.random.default_rng(burn_seed)
+    iterator = range(completed, cfg.burn_steps)
+    if progress:
+        from tqdm.auto import tqdm
+        iterator = tqdm(iterator, desc=f"{task['condition_id']} joint burn", unit="step", mininterval=1)
+    for index in iterator:
+        if backend["name"] == "torch":
+            normal = torch.randn((len(seeds),2,cfg.n,cfg.n), generator=rng, device=device, dtype=torch.float64)
+            phi = stepper(phi, normal)
+            if (index+1) % 100 == 0 or index+1 == cfg.burn_steps:
+                if not bool(torch.isfinite(phi).all()) or float(phi.abs().max()) > 30:
+                    raise FloatingPointError("Unstable joint burn-in; reduce dt")
+        else:
+            mu_kernel = (condition["strength"] * np.fft.ifft2(model.K*np.fft.fft2(phi)).real
+                         if condition["strength"] else np.zeros_like(phi))
+            phi = stencils.step(phi, mu_kernel, rng.normal(size=(len(seeds),2,cfg.n,cfg.n)),
+                a=cfg.a, b=cfg.b, kappa=cfg.kappa, lam=cfg.lam, zeta=cfg.zeta,
+                dx=cfg.dx, dt=cfg.dt, mobility=cfg.mobility, D=cfg.D)
+            if (index+1) % 100 == 0 or index+1 == cfg.burn_steps:
+                if not np.isfinite(phi).all() or np.max(abs(phi)) > 30:
+                    raise FloatingPointError("Unstable joint burn-in; reduce dt")
+    if isinstance(phi, torch.Tensor):
+        mass_error = float((phi.mean((-2,-1))-target_mass).abs().max())
+        terminal = phi.cpu()
+    else:
+        mass_error = float(np.max(abs(phi.mean(axis=(-2,-1))-target_mass)))
+        terminal = torch.from_numpy(phi)
+    _burn_checkpoint.cache_clear()
+    _atomic_torch(dict(signature=manifest["signature"], condition_id=task["condition_id"],
+        seeds=seeds, initial_hashes=hashes, fields=terminal, burn_steps=cfg.burn_steps,
+        burn_seed=burn_seed, mass_error=mass_error), path)
+    elapsed = time.perf_counter()-started
+    if progress:
+        print(f"{task['condition_id']}: joint burn complete in {elapsed:.2f}s; "
+              f"max mean drift={mass_error:.3e}", flush=True)
+    return dict(condition_id=task["condition_id"], cached=False, elapsed_seconds=elapsed)
+
+
+@lru_cache(maxsize=2)
+def _burn_checkpoint(path, stat_key):
+    return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
 
 
 def generate_trajectory_task(task: dict[str, Any], *, device: str = "cpu",
                              progress: bool = True) -> dict[str, Any]:
     """Generate or reuse one prepared trajectory; safe for separate processes.
 
-    Give every concurrent worker a distinct prepared task. The scheduler owns
-    preparation/finalization, and must not schedule the same task twice.
+    Give every concurrent worker a distinct prepared task after the joint burn
+    phase. The scheduler owns preparation/finalization and must not schedule the
+    same task twice. A direct serial call also prepares a missing burn checkpoint.
     """
     directory = Path(task["output_dir"])
     manifest_path = directory / "dataset.json"
@@ -817,22 +948,35 @@ def generate_trajectory_task(task: dict[str, Any], *, device: str = "cpu",
     if _generation_source(root) != manifest["source"]:
         raise ValueError("Solver/generator source changed after preparation; prepare again")
     effective = replace(config, strength=condition["strength"])
-    parameters = lramb.Parameters(**{key: getattr(effective, key) for key in
-        ("n", "dx", "dt", "a", "b", "kappa", "lam", "zeta", "mobility", "D", "mean")},
-        seed=task["seed"])
-    kernel = lramb.KernelSpec("poisson", strength=condition["strength"], ell=condition["solver_ell"])
-    model = lramb.ActiveModelB(parameters, kernel,
-        multiplier=np.zeros((config.n, config.n)) if condition["is_control"] else None)
+    model = _condition_model(lramb, effective, condition, task["seed"])
+    burn_path = directory / condition["burn_file"]
+    if not burn_path.is_file():
+        # Direct serial callers remain supported. Parallel schedulers perform
+        # the separate condition-level burn phase before dispatching shards.
+        generate_burnin_task(dict(output_dir=str(directory), signature=manifest["signature"],
+            condition_id=condition["condition_id"]), device=device, progress=progress)
+    stat = burn_path.stat()
+    burned = _burn_checkpoint(str(burn_path.resolve()), (stat.st_mtime_ns, stat.st_size))
+    burn_index = expected["burn_index"]
+    if (burned["signature"] != manifest["signature"]
+            or burned["condition_id"] != condition["condition_id"]
+            or burned["seeds"][burn_index] != task["seed"]
+            or tuple(burned["fields"].shape) != (sum(len(config.seeds(s)) for s in SPLITS), config.n, config.n)):
+        raise ValueError("Joint burn-in checkpoint does not match this trajectory")
+    burn_state = burned["fields"][burn_index].numpy()
+    original_hash = burned["initial_hashes"][burn_index]
     multipliers = _shell_multipliers(model)
     if progress:
         print(f"{GENERATOR_REVISION}: {condition['condition_id']}, {split} "
-              f"seed={task['seed']}, {config.burn_steps + config.production_steps:,} steps "
+              f"seed={task['seed']}, {config.production_steps:,} production steps after joint burn "
               f"({backend['name']}/{backend['device']})", flush=True)
     capture_movie = split == "test" and task["trajectory_index"] < config.movie_trajectories
     started = time.perf_counter()
-    trajectory = (_run_numpy(model, effective, multipliers, capture_movie=capture_movie)
+    trajectory = (_run_numpy(model, effective, multipliers, capture_movie=capture_movie,
+                             burn_state=burn_state, original_initial_hash=original_hash)
                   if backend["name"] == "numpy" else
-                  _run_torch(model, effective, multipliers, backend["device"], capture_movie=capture_movie))
+                  _run_torch(model, effective, multipliers, backend["device"], capture_movie=capture_movie,
+                             burn_state=burn_state, original_initial_hash=original_hash))
     _check_trajectory_reference(trajectory, ell=condition["ell"], split=split,
                                 seed=task["seed"], backend=backend)
     payload = {name: torch.as_tensor(trajectory[name]).unsqueeze(0).cpu() for name in
@@ -861,7 +1005,7 @@ def generate_trajectory_task(task: dict[str, Any], *, device: str = "cpu",
     elapsed = time.perf_counter() - started
     if progress:
         print(f"generated {condition['condition_id']}/{split} seed={task['seed']}: "
-              f"{elapsed:.2f} s, {(config.burn_steps + config.production_steps) / elapsed:.1f} "
+              f"{elapsed:.2f} s, {config.production_steps / elapsed:.1f} "
               f"steps/s; CUDA graph chunk={config.cuda_graph_steps}", flush=True)
     return dict(file=task["file"], condition_id=condition["condition_id"], split=split,
                 seed=task["seed"], cached=False, elapsed_seconds=elapsed)
@@ -925,7 +1069,8 @@ def generate_datasets(config: DatasetConfig, output_dir: str | Path,
                       progress: bool = True, force: bool = False) -> dict[str, Any]:
     """Serial convenience wrapper around the parallel-safe trajectory task API.
 
-    A single shard is resident while simulating. Matching shards resume after
+    All split members burn together per condition; production keeps one shard
+    resident while simulating. Matching shards resume after
     interruption; no full multi-trajectory train movie is concatenated in memory.
     The script scheduler can distribute ``trajectory_tasks`` among GPUs and
     call ``finalize_generation`` once all workers have finished.
@@ -935,12 +1080,14 @@ def generate_datasets(config: DatasetConfig, output_dir: str | Path,
         print(f"generator={GENERATOR_REVISION}; module={Path(__file__).resolve()}; "
               f"LRAMB={manifest['source']['lramb_root']}; backend={manifest['backend']}; "
               f"train pairs/condition={config.train_pairs:,}; torch={torch.__version__}", flush=True)
+    for task in manifest["burn_tasks"]:
+        generate_burnin_task(task, device=device, progress=progress)
     for task in manifest["trajectory_tasks"]:
         generate_trajectory_task(task, device=device, progress=progress)
     return finalize_generation(output_dir)
 
 
 __all__ = ["DatasetConfig", "dataset_preset", "condition_id", "dataset_conditions",
-           "generate_datasets", "prepare_generation", "generate_trajectory_task",
+           "generate_datasets", "prepare_generation", "generate_burnin_task", "generate_trajectory_task",
            "finalize_generation", "open_video_dataset", "load_dataset", "load_config",
            "load_movie_dataset", "initial_field", "read_manifest", "CHANNEL_NAMES", "SPLITS"]

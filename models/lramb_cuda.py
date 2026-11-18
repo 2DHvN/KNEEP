@@ -1,8 +1,8 @@
 """Optional CUDA-graph burn-in for the Poisson dataset generator.
 
-Only launch scheduling changes: each replay performs ``chunk_steps`` full
-Euler-Maruyama updates, including a fresh canonical rFFT after every update.
-The cache holds one graph per worker, reused across trajectory seeds and kernels.
+Each replay performs ``chunk_steps`` real-space Euler-Maruyama updates.
+The diagnostic rFFT is constructed once after burn-in. The cache holds one
+graph per worker and supports a full batch of independent fields.
 """
 
 import torch
@@ -22,12 +22,9 @@ class _BurnGraph:
                 normal = torch.randn((*self.phi.shape[:-2],2,*self.phi.shape[-2:]), dtype=phi.dtype,
                                      device=phi.device, generator=self.rng)
                 new = self.stepper(self.phi, normal)
-                canonical = torch.fft.rfft2(new, norm="ortho")
-
                 self.bad.logical_or_(~torch.isfinite(new).all() | (new.abs().max() > 30))
                 # Stable input addresses are essential for subsequent replays.
                 self.phi.copy_(new)
-                self.ph.copy_(canonical)
 
         # Warm up JIT, FFT plans and the allocator on the capture side stream.
         stream = torch.cuda.Stream(device=phi.device)
@@ -66,7 +63,7 @@ class _BurnGraph:
                 raise FloatingPointError("Unstable CUDA graph burn-in trajectory; reduce dt")
         rng.set_state(self.rng.get_state())
         # Do not expose storage that the next trajectory will overwrite.
-        return self.phi.clone(), self.ph.clone(), self.error.clone()
+        return self.phi.clone(), torch.fft.rfft2(self.phi, norm="ortho"), self.error.clone()
 
 
 _cached_key = None

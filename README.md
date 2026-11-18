@@ -107,6 +107,11 @@ kappa=4, mobility=1, lambda=10, D=0.1, g=0, dt=0.001, and tanh radius 16.
 CNEEP uses -a*phi while KNEEP uses a*phi, hence the sign change.
 Train/validation/test ensembles are 102/26/1, with 999/999/4999 transitions
 (1000/1000/5000 frames), and 10,000 burn-in steps (physical time 10).
+Burn-in combines all 129 members into **one batch**. `DATA["ensemble_batch"]`
+controls production batches only. Each member receives independent noise;
+the first test member's complete burn/production diagnostic trace is retained.
+The completed terminal fields are saved in `burn_state.pt` and reused after
+an interrupted generation. Burn and production use separate random streams.
 KNEEP retains its spatial discretization, noise streams, and EP estimators;
 matching parameters does not imply identical numerical trajectories.
 
@@ -164,7 +169,8 @@ scheduler, sampler and history at the last saved iteration (normally every 100
 updates), up to the configured iteration limit. Keep the same settings when
 resuming: changing training settings, including the iteration limit, selects a
 different fit directory. A completed fit proceeds to evaluation with `--resume`.
-Incomplete dataset generation restarts generation; it is not resumed per step.
+Incomplete production generation restarts from the saved joint burn endpoint;
+partial burn-in or production loops are not resumed mid-step.
 
 Training logs include sampled train loss, full-validation loss, LR and best
 iteration. `training_loss.png` is refreshed at each recorded evaluation.
@@ -351,14 +357,17 @@ overlaid directly. Main figures include:
 - Full-validation learning curves and recorded LR changes.
 - EP rates in consecutive windows (`--window-steps 64`).
 - Mean EP per observed step and KNEEP/direct-medium mean-rate ratio.
-- Signed shell means and temporal variances (two columns): `ep_spectrum.png`
+- Signed shell means, raw temporal variances, and pixel-normalized variances
+  (three columns): `ep_spectrum.png`
   uses linear mean EP; `ep_spectrum_log.png` uses signed logarithmic mean EP.
   Symlog retains negative/zero EP with a linear region within +/-1e-8;
   the radius axis stays linear including rho=0. Variance uses symlog in both.
-- Overlaid Var(j_rho) and Var(j_rho)/rho^2 in separate method rows.
+- Overlaid Var(j_rho) and Var(j_rho)/N_rho^2 in separate method rows.
+  N counts force-input pixels from each branch mask: 1, 8, 16, 24, ... .
+  The physical reference uses its own periodic shell sizes.
 - Time-averaged EP maps with linear colors.
 
-The fluctuation figure excludes rho=0 and cumulative shell sums. Temporal
+The fluctuation figure includes rho=0 (N=1) and shows individual branches. Temporal
 variance is calculated within each trajectory. KNEEP bands show fit-seed SD
 following trajectory averaging; medium bands show test-trajectory SD. These are
 descriptive spreads, not confidence intervals. Signed colors preserve negative EP.
@@ -395,9 +404,19 @@ Generation, condition/fit-seed training and condition evaluation run in parallel
 Each fit uses one GPU; VRAM is not combined. Use `--workers` to cap concurrency
 or `--device cpu --workers 4` for CPU workers.
 
+Generation first runs **one joint burn batch per physical condition**, combining
+train, validation and test (1024+64+128 = 1216 members for production_v3).
+Only current fields are resident during burn-in. Each condition saves
+`data/<condition>/burn_state.pt`; production trajectory tasks then read their
+own terminal field, without repeating burn-in. Conditions can burn on separate
+GPUs; a barrier separates the burn phase from distributed production.
+Matching completed burn checkpoints and production shards are reused on restart.
+The ordered batch and separate production streams are reproducible across
+conditions within a backend. Changing split counts changes the burn noise sequence.
+
 For small-grid generation, the CPU can spend most of its time launching tiny
 CUDA kernels. An optional burn-in graph runs up to 100 full Euler-Maruyama steps
-per replay (64 suggested), reusing the graph across trajectories in each worker:
+per replay, operating on the entire condition's batch:
 
 ```bash
 # From the KNEEP directory, inside an activated Python environment / tmux:
@@ -409,13 +428,13 @@ python -u scripts/lramb_poisson_range.py all --preset production_v3 \
 
 The option defaults to 0 (eager), requires CUDA graph support including custom
 generator registration, and is included in dataset provenance. Every burn-in
-step still computes its own noise, drift and canonical FFT. The custom generator
-advances on every replay; warmup does not consume the trajectory RNG stream.
+step still computes its own noise and real-space drift. A diagnostic spectrum
+is constructed once at the end. The custom generator advances on every replay;
+warmup does not consume the burn RNG stream.
 Production retains every-step midpoint EP. Saved fields are staged in a bounded
 64-frame device buffer before copying to CPU. Each generated trajectory reports
-elapsed seconds and steps/s, including reference checks and writing the shard;
-the first trajectory on each worker also includes graph warmup/capture overhead.
-Compare subsequent timings rather than GPU utilization alone.
+production seconds and steps/s, including reference checks and writing the shard.
+Joint burn-in timing is reported separately and includes graph warmup/capture.
 
 The graph path has not been executed or benchmarked on CUDA in the development
 environment. Capture errors propagate; restart with `--cuda-graph-steps 0` in a

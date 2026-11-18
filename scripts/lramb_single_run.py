@@ -74,6 +74,8 @@ def run(args):
 
     # Resolve repositories from this script, independent of the shell working directory.
     KNEEP_ROOT = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(KNEEP_ROOT))
+    from shell_force import branch_input_pixel_counts
     LRAMB_ROOT = (args.lramb_root.expanduser().resolve() if args.lramb_root else KNEEP_ROOT.parent/"LRAMB")
     sys.path.insert(0, str(LRAMB_ROOT))
     from lramb.model import Parameters, KernelSpec, ActiveModelB
@@ -288,7 +290,8 @@ def run(args):
     def signature(value):
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
-    DATA_META = dict(format="single-demo-tjhung-realspace-effective-ep-v3", physics=PHYS,
+    DATA_META = dict(format="single-demo-tjhung-joint-burn-v4", physics=PHYS,
+                     burn_protocol="all train+validation+test in one batch; independent production streams",
                      data=DATA, master_seed=SEED, device_type=DEVICE.type,
                      initialization=dict(kind=INITIALIZATION, radius=BASE["radius"], bvp=BVP, root=ROOT,
                          field_sha256=hashlib.sha256(INITIAL_FIELD.tobytes()).hexdigest()),
@@ -380,7 +383,51 @@ def run(args):
         temporary.replace(ACTIVE_META_PATH)
 
     @torch.inference_mode()
-    def generate_split(split):
+    def joint_burn_in():
+        counts = [DATA[f"{split}_members"] for split in ("train", "validation", "test")]
+        offsets = dict(zip(("train", "validation", "test"), (0, counts[0], counts[0]+counts[1])))
+        total, burn = sum(counts), DATA["burn_steps"]
+        checkpoint_path = DATA_DIR / "burn_state.pt"
+        if checkpoint_path.exists():
+            saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            if saved.get("signature") == DATA_ID and tuple(saved["fields"].shape) == (total,n,n):
+                print(f"Reusing joint burn-in checkpoint: {total} members")
+                return saved
+        rng = torch.Generator(device=DEVICE).manual_seed(SEED+40000)
+        phi = initial_batch(total)
+        target_mass = phi.mean((-2,-1)).clone()
+        max_mass_drift = torch.zeros((), **kw)
+        trace_times, trace_fields, trace_diag = [], [], []
+
+        def record_burn(step):
+            # Track exactly the first held-out member of this joint batch.
+            selected = phi[offsets["test"]:offsets["test"]+1]
+            trace_times.append((step-burn)*dt)
+            trace_fields.append(selected[0].float().cpu().clone())
+            trace_diag.append(diagnostics(selected, torch.fft.rfft2(selected, norm="ortho"))[0].cpu().clone())
+
+        print(f"Joint burn-in: train={counts[0]}, validation={counts[1]}, test={counts[2]}; batch={total}")
+        record_burn(0)
+        for step in tqdm(range(1,burn+1), desc=f"joint burn ({total} members)", mininterval=1):
+            normal = torch.randn((total,2,n,n), generator=rng, **kw)
+            phi = stepper(phi, normal)
+            if step % 100 == 0 or step == burn:
+                if not bool(torch.isfinite(phi).all()):
+                    raise FloatingPointError(f"Joint burn-in: unstable field at step {step}; reduce dt.")
+                max_mass_drift = torch.maximum(max_mass_drift, (phi.mean((-2,-1))-target_mass).abs().max())
+            if step % DATA["trace_stride"] == 0 or step == burn:
+                record_burn(step)
+        result = dict(signature=DATA_ID, fields=phi.cpu(), split_offsets=offsets,
+                      trace_time=torch.tensor(trace_times,dtype=torch.float64),
+                      trace_fields=torch.stack(trace_fields), trace_diagnostics=torch.stack(trace_diag))
+        temporary = checkpoint_path.with_suffix(".tmp.pt")
+        torch.save(result, temporary)
+        temporary.replace(checkpoint_path)
+        print(f"Joint burn-in max sampled mean drift={float(max_mass_drift.cpu()):.3e}")
+        return result
+
+    @torch.inference_mode()
+    def generate_split(split, burned):
         members, steps = DATA[f"{split}_members"], DATA[f"{split}_steps"]
         burn, chunk = DATA["burn_steps"], 64
         # Fixed, disjoint streams derived from ONE master seed.
@@ -401,7 +448,8 @@ def run(args):
         for first in range(0, members, DATA["ensemble_batch"]):
             last = min(first + DATA["ensemble_batch"], members)
             size = last-first
-            phi = initial_batch(size)
+            offset = burned["split_offsets"][split]
+            phi = burned["fields"][offset+first:offset+last].to(**kw).clone()
             ph = torch.fft.rfft2(phi, norm="ortho")
             target_mass = phi.mean((-2,-1))
             max_mass_drift = torch.zeros((), **kw)
@@ -412,12 +460,16 @@ def run(args):
                 active_buffer = torch.empty_like(map_buffer)
                 increment = torch.empty((size, steps, 3), **kw)
             trace_times, trace_fields, trace_diag = [], [], []
+            if split == "test" and first == 0:
+                trace_times = burned["trace_time"].tolist()
+                trace_fields = list(burned["trace_fields"].unbind())
+                trace_diag = list(burned["trace_diagnostics"].unbind())
 
             def record_trace(step):
                 if split == "test" and first == 0:
                     trace_times.append((step-burn)*dt)
-                    trace_fields.append(phi[0].float().clone())
-                    trace_diag.append(diagnostics(phi[:1], ph[:1])[0].clone())
+                    trace_fields.append(phi[0].float().cpu().clone())
+                    trace_diag.append(diagnostics(phi[:1], ph[:1])[0].cpu().clone())
 
             def record_frame(index):
                 capacity = field_buffer.shape[1]
@@ -426,9 +478,9 @@ def run(args):
                 if slot == capacity-1 or index == steps:
                     video[first:last, index-slot:index+1] = field_buffer[:, :slot+1].cpu().numpy()
 
-            record_trace(0)
-            iterator = tqdm(range(1, burn+steps+1),
-                desc=f"{split} members {first}:{last}", leave=False, mininterval=1)
+            record_frame(0)
+            iterator = tqdm(range(burn+1, burn+steps+1),
+                desc=f"{split} production {first}:{last}", leave=False, mininterval=1)
             for step in iterator:
                 new, new_hat = advance(phi, ph, rng)
                 if split == "test" and step > burn:
@@ -480,8 +532,10 @@ def run(args):
         manifest = dict(signature=DATA_ID, config=DATA_META, complete=False)
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         started = time.perf_counter()
+        burned = joint_burn_in()
         for split in ("train", "validation", "test"):
-            generate_split(split)
+            generate_split(split, burned)
+        del burned
         manifest["complete"] = True
         temporary = manifest_path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -1072,7 +1126,6 @@ def run(args):
     FLUCTUATION_WINDOW = 1
     FLUCTUATION_YSCALE = "symlog"    # retains exactly zero variance
     VAR_LINTHRESH = 1e-8
-    DIVIDE_BY_RHO_SQUARED = False
     if not isinstance(FLUCTUATION_WINDOW, int) or FLUCTUATION_WINDOW < 1:
         raise ValueError("Choose a positive integer fluctuation window.")
     complete_windows = length // FLUCTUATION_WINDOW
@@ -1082,22 +1135,24 @@ def run(args):
     shell_window_rate = pred_increment[:, :used].reshape(
         members, complete_windows, FLUCTUATION_WINDOW, shells).sum(2) / (FLUCTUATION_WINDOW*dt)
     variance_shell = shell_window_rate.var(axis=1, ddof=0).mean(0)
-    x, y = radii, variance_shell
-    ylabel = "temporal variance of predicted EP rate"
-    if DIVIDE_BY_RHO_SQUARED:
-        x, y = radii[1:], variance_shell[1:] / radii[1:]**2
-        ylabel += " / radius²"
-    fig, ax = plt.subplots(figsize=(7.5, 4))
-    ax.plot(x, y, "o-", color="C2")
-    if FLUCTUATION_YSCALE == "symlog":
-        ax.set_yscale("symlog", linthresh=VAR_LINTHRESH)
-    elif FLUCTUATION_YSCALE != "linear":
-        raise ValueError("Use linear or symlog to retain zero variance.")
-    ax.set(xlabel="Chebyshev shell radius", ylabel=ylabel, xticks=x,
-           title=f"Predicted shell fluctuation: window={FLUCTUATION_WINDOW*dt:g} time")
+    input_pixels = np.asarray(branch_input_pixel_counts(model), dtype=np.int64)
+    variance_per_pixel = variance_shell / input_pixels**2
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+    for ax, values, title, ylabel in zip(axes,
+            (variance_shell, variance_per_pixel),
+            ("Raw branch-output variance", "Variance / input pixels squared"),
+            ("Var(predicted EP / time)", "Var(predicted EP / time) / N_pixels^2")):
+        ax.plot(radii, values, "o-", color="C2")
+        if FLUCTUATION_YSCALE == "symlog":
+            ax.set_yscale("symlog", linthresh=VAR_LINTHRESH)
+        elif FLUCTUATION_YSCALE != "linear":
+            raise ValueError("Use linear or symlog to retain zero variance.")
+        ax.set(xlabel="Chebyshev shell radius", ylabel=ylabel, xticks=radii, title=title)
+    fig.suptitle(f"Predicted EP fluctuation: window={FLUCTUATION_WINDOW*dt:g} time")
     fig.tight_layout()
     fig.savefig(FIT_DIR / "pred_spectrum_fluctuation.png", dpi=150)
     plt.close(fig)
+    print("Branch input pixels (actual mask):", input_pixels.tolist())
     print("Local (rho=0) variance:", variance_shell[0])
     print("Total rate variance (includes cross-shell covariance):",
           shell_window_rate.sum(-1).var(axis=1, ddof=0).mean())
@@ -1114,7 +1169,9 @@ def run(args):
         predicted_increment=pred_increment, medium_increment=ref_increment,
         predicted_mean_density=pred_mean_density, medium_mean_density=medium_mean_density,
         active_increment=active_total, active_mean_density=active_mean_density,
-        radii=radii, metadata=json.dumps(eval_meta))
+        radii=radii, branch_input_pixel_counts=input_pixels,
+        branch_rate_variance=variance_shell, branch_rate_variance_per_pixel=variance_per_pixel,
+        metadata=json.dumps(eval_meta))
     print("Saved notebook outputs:", FIT_DIR)
     # Later, for plotting only:
     # with np.load(FIT_DIR / "evaluation.npz", allow_pickle=False) as data:

@@ -9,6 +9,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def branch_input_pixel_counts(model: nn.Module) -> tuple[int, ...]:
+    """Spatial support of each force branch, counted from its convolution mask.
+
+    Counts spatial pixels once, regardless of hidden/input channels. The final
+    local increment multiplication is not another force-input pixel.
+    """
+    counts = []
+    for branch in model.branches:
+        masks = [module.mask for module in branch.modules() if hasattr(module, "mask")]
+        if len(masks) > 1:
+            raise ValueError("Multiple spatial masks require composing the receptive field")
+        counts.append(int(torch.count_nonzero(masks[0][0, 0]).item()) if masks else 1)
+    return tuple(counts)
+
+
 def _activation(name: str) -> nn.Module:
     if name == "relu":
         return nn.ReLU(inplace=True)

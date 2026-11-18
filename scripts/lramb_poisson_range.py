@@ -31,6 +31,7 @@ from models.lramb_poisson import (
     dataset_preset,
     finalize_generation,
     generate_datasets,
+    generate_burnin_task,
     generate_trajectory_task,
     load_dataset,
     load_movie_dataset,
@@ -38,7 +39,7 @@ from models.lramb_poisson import (
     prepare_generation,
     read_manifest,
 )
-from shell_force import ShellForceKNEEP2D
+from shell_force import ShellForceKNEEP2D, branch_input_pixel_counts
 from utils.training import TrainingConfig, TrainingResult, train_model
 from utils.video_data import ShardedVideo
 
@@ -190,6 +191,9 @@ def _worker_task(task: dict, device: str, cpu_threads: int):
     target = _device(device)
     if target.type == "cuda":
         torch.cuda.set_device(target)
+    if task["stage"] == "burn":
+        return generate_burnin_task(task["payload"], device=str(target),
+                                   progress=task.get("progress", True))
     if task["stage"] == "generate":
         return generate_trajectory_task(task["payload"], device=str(target),
                                         progress=task.get("progress", True))
@@ -284,6 +288,10 @@ def generate_sweep(config, output_dir, *, lramb_root=None, device="auto",
         print(f"generator={manifest['generator_revision']}; "
               f"LRAMB={manifest['source']['lramb_root']}; backend={manifest['backend']}; "
               f"train pairs/condition={config.train_pairs:,}; torch={torch.__version__}", flush=True)
+    burn_tasks = [dict(stage="burn", payload=item, progress=progress,
+                       label=f"joint burn {item['condition_id']} (train+validation+test)")
+                  for item in manifest["burn_tasks"]]
+    _run_tasks(burn_tasks, targets, cpu_threads=cpu_threads, progress=progress)
     tasks = [dict(stage="generate", payload=item, progress=progress,
                   label=f"generate {item['condition_id']}/{item['split']}/{item['trajectory_index']}")
              for item in manifest["trajectory_tasks"]]
@@ -566,6 +574,7 @@ def _evaluate_condition(task: dict, target: torch.device) -> dict:
         if checkpoint["signature"] != training["signature"]:
             raise ValueError(f"checkpoint does not match training manifest: {checkpoint_path}")
         result = _restore(checkpoint, target)
+        input_pixel_counts = branch_input_pixel_counts(result.model)
         increment, mean_map = _predict(result, test["video"], interval, task["batch_size"], target)
         increments.append(increment)
         maps.append(mean_map)
@@ -580,6 +589,7 @@ def _evaluate_condition(task: dict, target: torch.device) -> dict:
         is_control=bool(condition.get("is_control", False)),
         interval=interval, dx=float(data["config"]["dx"]),
         predicted_increment=np.stack(increments), predicted_map=np.stack(maps),
+        branch_input_pixel_counts=np.asarray(input_pixel_counts, dtype=np.int64),
         reference_increment=_numpy(test["reference_increment"]),
         reference_map=_numpy(test["reference_map"]),
         reference_branch_increment=_numpy(test["reference_branch_increment"]),

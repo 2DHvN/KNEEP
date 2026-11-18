@@ -83,6 +83,25 @@ def _records(records: Records) -> list[Mapping[str, Any]]:
     return result
 
 
+def _input_pixel_counts(record, branches, *, reference=False):
+    """Actual branch support; reference shells also account for the periodic edge."""
+    if not reference and "branch_input_pixel_counts" in record:
+        counts = _array(record["branch_input_pixel_counts"])
+    elif reference and ("kernel_weights" in record or "n" in record.get("metadata", {}).get("dataset", {})):
+        n = (np.asarray(record["kernel_weights"]).shape[-1] if "kernel_weights" in record
+             else int(record["metadata"]["dataset"]["n"]))
+        offsets = np.rint(np.fft.fftfreq(n)*n).astype(int)
+        distances = np.maximum(abs(offsets[:,None]), abs(offsets[None,:]))
+        counts = np.bincount(distances.ravel(), minlength=branches)[:branches].astype(float)
+    else:
+        # Historical records used the same square-perimeter masks but did not
+        # save the counts. Radius 0 has one pixel; radius r>0 has 8*r pixels.
+        counts = np.maximum(1, 8*np.arange(branches)).astype(float)
+    if counts.shape != (branches,) or not np.isfinite(counts).all() or np.any(counts <= 0):
+        raise ValueError("Need one positive input-pixel count for every branch")
+    return counts
+
+
 def _condition_colors(records: Records) -> list[Any]:
     """Keep physical ranges on one palette and the g=0 control gray."""
     ells = sorted({float(record["ell"]) for record in records if condition_strength(record) != 0})
@@ -300,7 +319,7 @@ def plot_ep_spectrum(records: Records, *, log_scale: bool = False,
     if not np.isfinite(linthresh) or linthresh <= 0:
         raise ValueError("linthresh must be finite and positive")
     records = _records(records)
-    fig, axes = plt.subplots(len(records), 2, figsize=(11, 3.15 * len(records)), squeeze=False)
+    fig, axes = plt.subplots(len(records), 3, figsize=(16, 3.15 * len(records)), squeeze=False)
     for row, record in enumerate(records):
         prediction, _, interval = _increments(record)
         rate = prediction / interval
@@ -323,13 +342,20 @@ def plot_ep_spectrum(records: Records, *, log_scale: bool = False,
             ax.set_ylabel("EP / time (symlog)")
         variance = np.var(rate, axis=2).mean(1)
         reference_variance = np.var(reference, axis=1).mean(0)
-        ax = axes[row, 1]
         variance_mean, variance_spread = variance.mean(0), _std(variance)
-        ax.plot(radius, variance_mean, "o-", color=_LEARNED, label="KNEEP within-trajectory variance")
-        ax.fill_between(radius, np.maximum(variance_mean - variance_spread, 0), variance_mean + variance_spread, color=_LEARNED, alpha=0.2, label="fit-seed SD")
-        ax.plot(ref_radius, reference_variance, ".--", color=_REFERENCE, label="physical reference shells")
-        ax.set(title="Temporal variance by shell", ylabel="Var(EP / time)")
-        ax.set_yscale("symlog", linthresh=linthresh)
+        learned_counts = _input_pixel_counts(record, rate.shape[-1])
+        reference_counts = _input_pixel_counts(record, reference.shape[-1], reference=True)
+        for col, normalized in ((1, False), (2, True)):
+            ax = axes[row, col]
+            denom = learned_counts**2 if normalized else np.ones_like(learned_counts)
+            ref_denom = reference_counts**2 if normalized else np.ones_like(reference_counts)
+            mean, spread = variance_mean/denom, variance_spread/denom
+            ax.plot(radius, mean, "o-", color=_LEARNED, label="KNEEP within-trajectory variance")
+            ax.fill_between(radius, np.maximum(mean-spread, 0), mean+spread, color=_LEARNED, alpha=0.2, label="fit-seed SD")
+            ax.plot(ref_radius, reference_variance/ref_denom, ".--", color=_REFERENCE, label="physical reference shells")
+            ax.set(title="Variance / input pixels squared" if normalized else "Temporal variance by branch",
+                   ylabel="Var(EP / time) / N_pixels^2" if normalized else "Var(EP / time)")
+            ax.set_yscale("symlog", linthresh=linthresh)
         for ax in axes[row]:
             ax.set_xlabel("Chebyshev shell radius (physical length)")
             _style(ax)
@@ -346,7 +372,7 @@ def plot_fluctuation_comparison(records: Records) -> Figure:
     """Overlay interaction ranges, with learned and direct gauges in two rows.
 
     Rates are saved increments divided by the physical observation interval.
-    Both columns omit radius zero and show individual-shell fluctuations.
+    Both columns include radius zero and show raw or per-input-pixel variance.
     Variance is computed within each trajectory (ddof=0), then averaged over
     trajectories and, for KNEEP, fit seeds. Bands are descriptive standard
     deviations across fit seeds (top) or trajectories (bottom), not CIs.
@@ -360,7 +386,7 @@ def plot_fluctuation_comparison(records: Records) -> Figure:
     fig, axes = plt.subplots(2, 2, figsize=(12, 8.5), sharex="col", sharey="col")
     maxima: list[list[np.ndarray]] = [[], []]
     titles = (r"Shell variance: $\mathrm{Var}_t(j_\rho)$",
-              r"Distance scaling: $\mathrm{Var}_t(j_\rho)/\rho^2$")
+              r"Input-pixel normalization: $\mathrm{Var}_t(j_\rho)/N_\rho^2$")
     for color, linestyle, record in zip(colors, _condition_linestyles(records), records):
         predicted, _, interval = _increments(record)
         direct = _array(record["reference_branch_increment"])
@@ -369,15 +395,17 @@ def plot_fluctuation_comparison(records: Records) -> Figure:
         dx = float(record["dx"])
         if not np.isfinite(dx) or dx <= 0:
             raise ValueError("dx must be positive and finite")
-        learned_rate, direct_rate = predicted[..., 1:] / interval, direct[..., 1:] / interval
-        radii = (np.arange(1, predicted.shape[-1]) * dx,
-                 np.arange(1, direct.shape[-1]) * dx)
+        learned_rate, direct_rate = predicted / interval, direct / interval
+        radii = (np.arange(predicted.shape[-1]) * dx,
+                 np.arange(direct.shape[-1]) * dx)
+        counts = (_input_pixel_counts(record, predicted.shape[-1]),
+                  _input_pixel_counts(record, direct.shape[-1], reference=True))
         # Keep independent trajectories separate, and retain fit-seed variation.
         learned_shell = np.var(learned_rate, axis=2, ddof=0).mean(axis=1)
         direct_shell = np.var(direct_rate, axis=1, ddof=0)
         statistics = (
-            (learned_shell, learned_shell / radii[0] ** 2),
-            (direct_shell, direct_shell / radii[1] ** 2),
+            (learned_shell, learned_shell / counts[0] ** 2),
+            (direct_shell, direct_shell / counts[1] ** 2),
         )
         for row in range(2):
             for col, samples in enumerate(statistics[row]):
@@ -394,7 +422,7 @@ def plot_fluctuation_comparison(records: Records) -> Figure:
             method = "KNEEP" if row == 0 else "Direct medium reference"
             axes[row, col].set_title(f"{method}\n{titles[col]}", fontsize=11)
             axes[row, col].set_xlabel("Chebyshev shell radius rho (physical length)")
-            axes[row, col].set_ylabel("Var(EP / time) / length squared" if col == 1
+            axes[row, col].set_ylabel("Var(EP / time) / N_pixels^2" if col == 1
                                       else "Var(EP / time)")
             axes[row, col].set_xlim(left=0)
             _style(axes[row, col])
@@ -405,9 +433,9 @@ def plot_fluctuation_comparison(records: Records) -> Figure:
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.955),
                ncol=min(len(records), 4), fontsize=8)
-    fig.suptitle("Interaction-range dependence of nonlocal shell fluctuations", y=0.995, fontsize=14)
+    fig.suptitle("Interaction-range dependence of branch fluctuations", y=0.995, fontsize=14)
     fig.text(0.5, 0.025,
-             "All panels omit rho=0. Color identifies ell; line style identifies g. Rates use increment / saved interval.\n"
+             "Includes rho=0 (N=1). N counts force-input pixels; physical shells use periodic pixel counts.\n"
              "The two decompositions have different gauges. Direct midpoint medium EP is not exact stationary total EP; shared symlog scales retain zeros.",
              ha="center", va="bottom", fontsize=8.5)
     legend_top = 0.91 if len(records) <= 5 else 0.82
@@ -430,8 +458,8 @@ def _periodogram(rate: np.ndarray, interval: float) -> tuple[np.ndarray, np.ndar
 def plot_temporal_spectrum(records: Records) -> Figure:
     """Across-range PSD and TOTAL-rate variance, in separate method rows.
 
-    Unlike ``plot_fluctuation_comparison``, these global statistics include
-    radius zero, all nonlocal shells, and active/local reference components.
+    These global statistics sum radius zero, all nonlocal shells, and the
+    active/local reference components, retaining cross-branch covariances.
     Signed contributions are summed before periodograms or variances, and
     independent trajectories are never concatenated across boundaries.
     """
