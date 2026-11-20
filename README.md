@@ -497,3 +497,56 @@ spectrum for the next drift, midpoint entropy and shell endpoint energies.
 Kernel-shell sums are checked per trajectory before finalizing the split.
 Reported CUDA assertion failures were not reproduced locally; tolerances were
 not relaxed. New physical settings require a fresh v3 directory.
+
+### Batched stationary g sweep (no fitting)
+
+From the KNEEP directory:
+
+```bash
+python scripts/lramb_g_steady.py --g 0 0.25 0.5 1 2 --trajectories 8 --device auto
+```
+
+This uses the sibling LRAMB Poisson solver at fixed `--ell 2`, with
+`--burn-time 20000`, `--dt 0.01` (2,000,000 burn steps), and
+`--production-time 1000`. Other defaults are n=32, D=0.05, mean=-0.2,
+lambda=0.8, zeta=0, and random initialization. All g/replica combinations
+are evolved in one float64 tensor batch with independent noise entries.
+CUDA uses graph replay (`--graph-steps 20`, 0 disables); CPU uses eager
+PyTorch. Actual graph length divides both sampling cadences and phase
+lengths and is recorded in config.json. Larger batches need more memory.
+
+Outputs under `results/g_steady`:
+
+- `g_*/traj_*/field_fluctuation.png`: spatial field variance from t=0,
+  with the burn-in boundary marked. Inspect its plateau; no automatic
+  stationary-state claim is made from elapsed time alone.
+- `g_*/traj_*/steady_state.gif`: production-window field movie for every
+  replica. Use `--movie-format mp4` with an installed ffmpeg for compact video.
+- `ensemble_epr_vs_g.png` and CSV: spatially integrated active-only EPR,
+  computed at **every solver step**, regardless of movie/diagnostic cadence.
+  Each replica's EP/time is averaged with equal weight; error bars are SEM
+  across independent replica means, not across correlated time samples.
+  With one replica SEM is undefined (NaN in CSV, no error bar).
+- `ensemble_ep_vs_g.png` and CSV: cumulative production-window active EP.
+- `cluster_size_vs_g.png` and CSV: replica/time-averaged cluster area.
+  A cluster is a four-connected `phi > --cluster-threshold` component
+  (default 0), merging periodic boundaries. The per-frame number-average
+  area is averaged in time by trapezoidal integration. No positive-phase
+  sites means area 0. This measures area, not radius or spectral wavelength.
+- `fields.npy`, `observables.npz`, `config.json`: sampled movie fields,
+  full burn/production variance trace, cumulative production EP, mass errors,
+  and resolved settings. Burn-in fields are not stored as movies.
+
+Active-only increments are `-sum(mu_active_eff(phi_mid)*dphi)*dx^2/D`;
+there is no system-entropy term or conservative boundary term. "Total"
+here means integrated over the entire spatial grid, not EP per unit area.
+The variance diagnostic is necessary evidence to inspect, not proof that
+slow morphology has equilibrated; compare independent replicas as well.
+
+Use a fresh `--output` for each experiment. Plotting can be rerun without
+simulation using `--plot-only --output results/g_steady`. The production
+run is long; a CPU smoke check is:
+
+```bash
+python scripts/lramb_g_steady.py --g 0 0.5 --trajectories 2 --n 8 --burn-time 0.04 --production-time 0.06 --diagnostic-every 2 --movie-every 2 --device cpu --output results/g_steady_smoke
+```
