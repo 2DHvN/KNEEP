@@ -503,13 +503,21 @@ not relaxed. New physical settings require a fresh v3 directory.
 From the KNEEP directory:
 
 ```bash
-python scripts/lramb_g_steady.py --g 0 0.25 0.5 1 2 --trajectories 8 --device auto
+python scripts/lramb_g_steady.py --device auto
 ```
 
 This uses the sibling LRAMB Poisson solver at fixed `--ell 2`, with
 `--burn-time 20000`, `--dt 0.01` (2,000,000 burn steps), and
-`--production-time 1000`. Other defaults are n=32, D=0.05, mean=-0.2,
-lambda=0.8, zeta=0, and random initialization. All g/replica combinations
+`--production-time 1000`. Other defaults are g=[-0.02,-0.01,0,0.01,0.02], 5 replicas per g,
+n=64, a=-0.25, b=0.25, kappa=1, D=0.1, lambda=1, and zeta=0.
+Initialization is a centered tanh droplet with radius 16, amplitude
+sqrt(-a/b), and width sqrt(2*kappa/(-a)), matching poisson_sanity.
+There is no mean shift: the geometric initial mean is conserved and recorded
+as resolved_mean. All replicas start from the same droplet and receive
+independent noise. Use --radius to change droplet mass, or --initial
+random/stripe with optional --mean (default -0.2). initial_fields.npy stores
+the actual starting fields. Diagnostics are recorded every 10 steps
+(time 0.1), movies every 100 steps (time 1). All g/replica combinations
 are evolved in one float64 tensor batch with independent noise entries.
 CUDA uses graph replay (`--graph-steps 20`, 0 disables); CPU uses eager
 PyTorch. Actual graph length divides both sampling cadences and phase
@@ -520,8 +528,8 @@ Outputs under `results/g_steady`:
 - `g_*/traj_*/field_fluctuation.png`: spatial field variance from t=0,
   with the burn-in boundary marked. Inspect its plateau; no automatic
   stationary-state claim is made from elapsed time alone.
-- `g_*/traj_*/steady_state.gif`: production-window field movie for every
-  replica. Use `--movie-format mp4` with an installed ffmpeg for compact video.
+- `g_*/traj_*/steady_state.mp4`: production-window field movie for every
+  replica. MP4 requires installed ffmpeg; use `--movie-format gif` if unavailable.
 - `ensemble_epr_vs_g.png` and CSV: spatially integrated active-only EPR,
   computed at **every solver step**, regardless of movie/diagnostic cadence.
   Each replica's EP/time is averaged with equal weight; error bars are SEM
@@ -548,5 +556,5 @@ simulation using `--plot-only --output results/g_steady`. The production
 run is long; a CPU smoke check is:
 
 ```bash
-python scripts/lramb_g_steady.py --g 0 0.5 --trajectories 2 --n 8 --burn-time 0.04 --production-time 0.06 --diagnostic-every 2 --movie-every 2 --device cpu --output results/g_steady_smoke
+python scripts/lramb_g_steady.py --g 0 0.5 --trajectories 2 --n 8 --radius 2 --movie-format gif --burn-time 0.04 --production-time 0.06 --diagnostic-every 2 --movie-every 2 --device cpu --output results/g_steady_smoke
 ```

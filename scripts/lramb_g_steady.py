@@ -22,28 +22,31 @@ from models.lramb_poisson import _lramb_module
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--g', nargs='+', type=float, default=[0, .25, .5, 1, 2])
-    p.add_argument('--trajectories', type=int, default=8)
+    p.add_argument('--g', nargs='+', type=float, default=[-.02, -.01, 0, .01, .02])
+    p.add_argument('--trajectories', type=int, default=5)
     p.add_argument('--burn-time', type=float, default=20000)
     p.add_argument('--production-time', type=float, default=1000)
     p.add_argument('--dt', type=float, default=.01)
-    p.add_argument('--diagnostic-every', type=int, default=1000,
+    p.add_argument('--diagnostic-every', type=int, default=10,
                    help='steps between field variance records, including burn-in')
-    p.add_argument('--movie-every', type=int, default=500,
+    p.add_argument('--movie-every', type=int, default=100,
                    help='production steps between movie/cluster samples')
     p.add_argument('--graph-steps', type=int, default=20,
                    help='CUDA graph chunk length; 0 disables, CPU always eager')
     p.add_argument('--device', default='auto')
     p.add_argument('--cpu-threads', type=int, default=1)
     p.add_argument('--seed', type=int, default=1701)
-    p.add_argument('--n', type=int, default=32)
-    for name, default in dict(dx=1., a=-1., b=1., kappa=1., lam=.8,
-                              zeta=0., mobility=1., D=.05, mean=-.2, ell=2.).items():
+    p.add_argument('--n', type=int, default=64)
+    for name, default in dict(dx=1., a=-.25, b=.25, kappa=1., lam=1.,
+                              zeta=0., mobility=1., D=.1, ell=2.).items():
         p.add_argument('--'+name, type=float, default=default)
-    p.add_argument('--initial', choices=['random', 'stripe'], default='random')
+    p.add_argument('--initial', choices=['tanh', 'random', 'stripe'], default='tanh')
+    p.add_argument('--radius', type=float, default=16., help='tanh droplet radius in physical length units')
+    p.add_argument('--mean', type=float, default=None,
+                   help='random/stripe only (default -0.2); tanh mean follows the droplet geometry')
     p.add_argument('--cluster-threshold', type=float, default=0.)
     p.add_argument('--fps', type=int, default=15)
-    p.add_argument('--movie-format', choices=['gif', 'mp4'], default='gif')
+    p.add_argument('--movie-format', choices=['gif', 'mp4'], default='mp4')
     p.add_argument('--lramb-root', type=Path)
     p.add_argument('--output', type=Path, default=ROOT/'results'/'g_steady')
     p.add_argument('--plot-only', action='store_true', help='render existing saved data')
@@ -55,6 +58,22 @@ def step_count(duration, dt):
     if not math.isfinite(ratio) or ratio < 0 or not math.isclose(ratio, round(ratio), abs_tol=1e-7):
         raise ValueError('Times must be nonnegative integer multiples of dt')
     return round(ratio)
+
+
+def tanh_droplet(args):
+    """Same centered periodic-distance profile as poisson_sanity; no mean shift."""
+    length = args.n * args.dx
+    if (not np.isfinite([args.radius, args.a, args.b, args.kappa, length]).all()
+            or not 0 < args.radius < length/2 or args.a >= 0
+            or min(args.b, args.kappa) <= 0):
+        raise ValueError('tanh requires a<0, b/kappa>0, and 0<radius<n*dx/2')
+    if args.mean is not None:
+        raise ValueError('--mean is only for random/stripe; tanh conserves its geometric mean')
+    coord = (np.arange(args.n)*args.dx) % length - length/2
+    x, y = np.meshgrid(coord, coord)
+    amplitude = math.sqrt(-args.a/args.b)
+    width = math.sqrt(2*args.kappa/(-args.a))
+    return amplitude*np.tanh((args.radius-np.hypot(x, y))/width)
 
 
 class Chunk:
@@ -126,6 +145,10 @@ def cluster_area(field, threshold, dx):
 
 @torch.inference_mode()
 def simulate(args):
+    if args.movie_format == 'mp4':
+        from matplotlib.animation import FFMpegWriter
+        if not FFMpegWriter.isAvailable():
+            raise RuntimeError('MP4 requires ffmpeg; install it or use --movie-format gif')
     if args.dt <= 0 or not math.isfinite(args.dt):
         raise ValueError('dt must be finite and positive')
     burn = step_count(args.burn_time, args.dt)
@@ -144,8 +167,11 @@ def simulate(args):
     torch.set_num_threads(args.cpu_threads)
     root, lramb = _lramb_module(args.lramb_root)
     from lramb.torch_stencils import from_model
+    droplet = tanh_droplet(args) if args.initial == 'tanh' else None
+    resolved_mean = float(droplet.mean()) if droplet is not None else (-.2 if args.mean is None else args.mean)
     params = lramb.Parameters(**{k: getattr(args, k) for k in
-        ('n', 'dx', 'dt', 'a', 'b', 'kappa', 'lam', 'zeta', 'mobility', 'D', 'mean')}, seed=args.seed)
+        ('n', 'dx', 'dt', 'a', 'b', 'kappa', 'lam', 'zeta', 'mobility', 'D')},
+        mean=resolved_mean, seed=args.seed)
     model = lramb.ActiveModelB(params, lramb.KernelSpec('poisson', strength=1., ell=args.ell))
     stepper = from_model(model, device, torch.float64)
     batch = len(args.g)*args.trajectories
@@ -155,7 +181,7 @@ def simulate(args):
     fields = []
     for i in range(batch):
         model.rng = np.random.default_rng(args.seed+i)
-        fields.append(model.initial_field(args.initial))
+        fields.append(droplet.copy() if droplet is not None else model.initial_field(args.initial))
     phi = torch.tensor(np.stack(fields), device=device, dtype=torch.float64)
     initial_mass = phi.mean((-2, -1)).clone()
     rng = torch.Generator(device=device).manual_seed(args.seed)
@@ -166,11 +192,13 @@ def simulate(args):
     args.output.mkdir(parents=True, exist_ok=True)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     config.update(device=str(device), lramb_root=str(root), burn_steps=burn,
+                  resolved_mean=resolved_mean,
                   production_steps=production, effective_graph_steps=chunk_steps if capture else 0,
                   ep_definition='-sum(mu_active_eff(midpoint)*dphi)*dx^2/D; every solver step',
                   cluster_definition='number-average phi>threshold component area; periodic 4-connectivity',
                   complete=False)
     (args.output/'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
+    np.save(args.output/'initial_fields.npy', np.stack(fields))
     frame_steps = sorted(set([0, production, *range(args.movie_every, production, args.movie_every)]))
     movie = np.lib.format.open_memmap(args.output/'fields.npy', mode='w+', dtype=np.float32,
                                      shape=(batch, len(frame_steps), args.n, args.n))
