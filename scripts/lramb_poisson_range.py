@@ -1,7 +1,8 @@
 """Separate generation, unsupervised fitting and evaluation of a Poisson range sweep.
 
 Run ``python KNEEP/scripts/lramb_poisson_range.py --help`` from the workspace.
-Only the generate command needs the sibling LRAMB repository.
+Generation (generate/training/all) needs the sibling LRAMB repository.
+resume extends saved fits; plot evaluates saved models and renders reports.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import numpy as np
 import torch
 
 from models.lramb_poisson import (
+    DatasetConfig,
     condition_id,
     dataset_preset,
     finalize_generation,
@@ -46,7 +48,7 @@ from utils.video_data import ShardedVideo
 
 @dataclass(frozen=True)
 class FitConfig:
-    max_distance: int = 8
+    max_distance: int = 6
     hidden_channels: int = 32
     hidden_layers: int = 2
     repeats: int = 3
@@ -59,6 +61,11 @@ class FitConfig:
 
 
 def fit_preset(name: str) -> FitConfig:
+    if name in {"production"}:
+        return FitConfig(max_distance=6, hidden_channels=64, hidden_layers=2, repeats=5, training=TrainingConfig(
+            iterations=10000, train_batch_size=8192, train_micro_batch_size=1024,
+            validation_batch_size=128, prediction_batch_size=128,
+            validate_every=100, weight_decay=0., lr_scheduler="none"))
     if name == "quick":
         return FitConfig(
             max_distance=2, hidden_channels=4, hidden_layers=1, repeats=2,
@@ -67,39 +74,10 @@ def fit_preset(name: str) -> FitConfig:
         )
     if name == "demo":
         return FitConfig()
-    if name == "refined":
-        # Tune sampling/optimization without changing the force function class.
-        # Full validation is larger at sample_every=1, so evaluate less often.
-        return FitConfig(training=TrainingConfig(
-            iterations=20_000, train_batch_size=128, validation_batch_size=128,
-            prediction_batch_size=64, learning_rate=3e-4, weight_decay=1e-5,
-            validate_every=500,
-        ))
-    if name == "production":
-        return FitConfig(max_distance=12, training=TrainingConfig(
-            iterations=10_000, train_batch_size=1024,
-            train_micro_batch_size=128, validation_batch_size=128,
-            prediction_batch_size=128, learning_rate=1e-3, weight_decay=1e-4,
-            validate_every=500,
-        ))
-    if name == "production_v2":
-        previous = fit_preset("production")
-        return replace(previous, max_distance=15, training=replace(
-            previous.training, lr_scheduler="cosine", lr_warmup_steps=500,
-            lr_min=1e-5,
-        ))
-    if name == "production_v3":
-        previous = fit_preset("production_v2")
-        return replace(previous, training=replace(
-            previous.training, lr_scheduler="plateau", lr_warmup_steps=0,
-            validate_every=250, lr_plateau_factor=0.5,
-            lr_plateau_patience=3, lr_plateau_threshold=1e-3,
-            lr_plateau_cooldown=1,
-        ))
     if name == "reference":
         return FitConfig(hidden_layers=3, repeats=5,
             training=replace(FitConfig().training, iterations=5_000))
-    raise ValueError("preset must be quick, demo, refined, production, production_v2, production_v3 or reference")
+    raise ValueError("preset must be quick, demo, production or reference")
 
 
 def _device(value: str | torch.device) -> torch.device:
@@ -209,9 +187,6 @@ def _run_tasks(tasks: list[dict], devices, *, cpu_threads=1, progress=True):
     devices = tuple(str(_device(value)) for value in devices)
     if not devices or cpu_threads < 1:
         raise ValueError("supply at least one device and positive CPU threads")
-    cuda_devices = [value for value in devices if torch.device(value).type == "cuda"]
-    if len(cuda_devices) != len(set(cuda_devices)):
-        raise ValueError("only one experiment worker may be assigned to each CUDA device")
     if not tasks:
         return []
     if len(devices) == 1:
@@ -305,7 +280,7 @@ def _train_repeat(task: dict, target: torch.device) -> dict:
     folder, condition = Path(task["output_dir"]), task["condition"]
     cid, repeat = condition["condition_id"], task["repeat"]
     path = Path(task["checkpoint"])
-    if path.exists() and not task["force"]:
+    if path.exists() and not task["force"] and not task.get('resume_path'):
         if _load_checkpoint(path).get("signature") != task["signature"]:
             raise ValueError(f"stale checkpoint: {path}; use --force")
         return dict(checkpoint=str(path), reused=True)
@@ -319,11 +294,36 @@ def _train_repeat(task: dict, target: torch.device) -> dict:
     if task["progress"]:
         print(f"{_condition_label(condition)}, fit seed {repeat}: "
               f"{train_video.shape[0] * (train_video.shape[1] - 1):,} train pairs", flush=True)
+    state = None
+    if task.get('resume_path'):
+        saved = _load_checkpoint(Path(task['resume_path']))
+        state = saved.get('resume_state')
+        if state is None:
+            # Historical files contain only the validation-best model. They
+            # support further fitting, but cannot restore lost Adam/RNG state.
+            history = saved['history']
+            state = dict(iteration=history['iterations'][-1], model_state=saved['model_state'],
+                mean=saved['mean'], std=saved['std'], best_model_state=saved['model_state'],
+                best_iteration=saved['best_iteration'], best_validation_loss=saved['best_validation_loss'],
+                best_learning_rate=saved.get('best_learning_rate'),
+                history_iterations=history['iterations'], train_losses=history['train_losses'],
+                validation_losses=history['validation_losses'], learning_rates=history.get('learning_rates', []),
+                next_learning_rates=history.get('next_learning_rates', []),
+                schedule_iterations=saved['config']['training']['iterations'])
+            print(f'{cid} repeat {repeat}: legacy best-weight continuation; optimizer and RNG restart.', flush=True)
+        else:
+            print(f'{cid} repeat {repeat}: resume update {state["iteration"]} -> {config.training.iterations}', flush=True)
+    checkpoint_metadata = dict(signature=task['signature'], config=asdict(config), repeat=repeat,
+        condition=condition, device=str(target), training_seed=config.base_seed+repeat,
+        dataset_signature=data['signature'])
+    def save_last(current):
+        _save_checkpoint(path.with_suffix('.last.pt'), dict(checkpoint_metadata, resume_state=current))
     result = train_model(
         train_video, validation_video, config.training,
         model_seed=config.base_seed + repeat, device=target, n_components=1,
         hidden_channels=config.hidden_channels, hidden_layers=config.hidden_layers,
         max_distance=config.max_distance, activation=config.activation, progress=task["progress"],
+        resume_state=state, checkpoint_callback=save_last,
     )
     if not np.isfinite(result.best_validation_loss):
         raise FloatingPointError("nonfinite validation loss; reduce learning rate or batch interval")
@@ -334,6 +334,7 @@ def _train_repeat(task: dict, target: torch.device) -> dict:
         mean=result.mean.detach().cpu(), std=result.std.detach().cpu(),
         best_iteration=result.best_iteration, best_validation_loss=result.best_validation_loss,
         best_learning_rate=result.best_learning_rate,
+        resume_state=result.resume_state, dataset_signature=data['signature'],
         history=dict(iterations=list(result.history_iterations),
             train_losses=list(result.train_losses), validation_losses=list(result.validation_losses),
             learning_rates=list(result.learning_rates),
@@ -344,7 +345,7 @@ def _train_repeat(task: dict, target: torch.device) -> dict:
 
 def train_sweep(output_dir: str | Path, config: FitConfig, *, device="auto",
                 devices=None, cpu_threads=1, shard_cache_size=128,
-                progress=True, force=False) -> dict:
+                progress=True, force=False, resume=False) -> dict:
     """Fit only saved train/validation videos; never generate or inspect test data.
 
     Completed repeats are reused. A changed dataset, model or source requires
@@ -363,29 +364,60 @@ def train_sweep(output_dir: str | Path, config: FitConfig, *, device="auto",
                     source_hash=_source_hash(), device=target.type)
     signature = _hash(protocol)
     path = folder / "training.json"
+    previous = None
     if path.exists():
         previous = json.loads(path.read_text(encoding="utf-8"))
-        if previous["signature"] != signature and not force:
-            raise ValueError("training settings changed; use a new output directory or --force")
+        if previous["signature"] != signature and not force and not resume:
+            raise ValueError("training settings changed; use resume to extend iterations, otherwise a new output directory or --force")
+    if resume:
+        if force:
+            raise ValueError('resume cannot be combined with --force')
+        if previous is None or previous['dataset_signature'] != data['signature']:
+            raise ValueError('resume needs a training manifest for the same saved dataset')
+        old_config, new_config = json.loads(json.dumps(previous['config'])), asdict(config)
+        old_iterations = old_config['training'].pop('iterations')
+        new_iterations = new_config['training'].pop('iterations')
+        if old_config != new_config or new_iterations < old_iterations:
+            raise ValueError('resume may only increase --iterations; model and other training settings must match')
     manifest = dict(signature=signature, **protocol, complete=False)
-    _write_json(path, manifest)
+    accepted_signatures = {signature}
+    if resume:
+        accepted_signatures.update([previous['signature'], *previous.get('resume_from_signatures', [])])
+        manifest['resume_from_signatures'] = sorted(accepted_signatures)
     tasks = []
     for condition in data["conditions"]:
         cid = condition["condition_id"]
         for repeat in range(config.repeats):
             checkpoint_path = folder / "checkpoints" / cid / f"repeat_{repeat:03d}.pt"
+            resume_path = None
             if checkpoint_path.exists() and not force:
                 saved = _load_checkpoint(checkpoint_path)
-                if saved.get("signature") != signature:
+                if saved.get("signature") not in accepted_signatures:
                     raise ValueError(f"stale checkpoint: {checkpoint_path}; use --force")
-                if progress:
-                    print(f"{_condition_label(condition)}, repeat={repeat + 1}: reusing completed fit", flush=True)
-                continue
+                if saved.get('signature') == signature:
+                    if progress:
+                        print(f"{_condition_label(condition)}, repeat={repeat + 1}: reusing completed fit", flush=True)
+                    continue
+                if resume:
+                    resume_path = checkpoint_path
+            last_path = checkpoint_path.with_suffix('.last.pt')
+            if resume and last_path.exists():
+                last = _load_checkpoint(last_path)
+                if (last.get('signature') not in accepted_signatures
+                        or last.get('dataset_signature') != data['signature']
+                        or last['repeat'] != repeat or last['condition']['condition_id'] != cid):
+                    raise ValueError(f'incompatible resume checkpoint: {last_path}')
+                resume_path = last_path
             tasks.append(dict(stage="train", output_dir=str(folder.resolve()),
                 config=asdict(config), condition=condition, repeat=repeat,
                 checkpoint=str(checkpoint_path.resolve()), signature=signature,
                 force=force, progress=progress, shard_cache_size=shard_cache_size,
+                resume_path=str(resume_path) if resume_path else None,
                 label=f"train {_condition_label(condition)}, repeat={repeat}"))
+    # Start different g conditions before launching another fit of the same g.
+    tasks.sort(key=lambda task: task["repeat"])
+    # Validate every checkpoint before invalidating the old evaluation manifest.
+    _write_json(path, manifest)
     _run_tasks(tasks, targets, cpu_threads=cpu_threads, progress=progress)
     manifest["complete"] = True
     _write_json(path, manifest)
@@ -608,6 +640,8 @@ def _evaluate_condition(task: dict, target: torch.device) -> dict:
             movie_window_start=_numpy(movie["window_start"]),
             movie_window_end=_numpy(movie["window_end"]),
             movie_trajectory=movie_trajectory)
+        if "active_rate_maps" in movie:
+            record["movie_active_rate"] = _numpy(movie["active_rate_maps"])
         record["metadata"]["movie"] = dict(trajectory=movie_trajectory,
             units="per-site EP / physical time; sum over sites gives window mean global rate",
             reference="all solver-step midpoint medium EP, integrated within each window",
@@ -632,8 +666,8 @@ def evaluate_sweep(output_dir: str | Path, *, device="auto", devices=None,
     training = json.loads((folder / "training.json").read_text(encoding="utf-8"))
     if not training.get("complete") or training["dataset_signature"] != data["signature"]:
         raise ValueError("complete matching training is required before evaluation")
-    if training.get("source_hash") != _source_hash():
-        raise ValueError("model or training source changed; rerun the train stage with --force before evaluation")
+    if training.get("source_hash") != _source_hash() and progress:
+        print('Evaluating saved model with the current evaluator; training source provenance is retained.', flush=True)
     targets = tuple(devices) if devices is not None else (str(_device(device)),)
     if not targets:
         raise ValueError("supply at least one execution device")
@@ -666,6 +700,7 @@ def _save_summary(folder: Path, records: list[dict]) -> None:
         reference_rate = r["reference_increment"].sum(axis=-1) / r["interval"]
         repeat_means = predicted_rate.mean(axis=(1, 2))
         medium_mean = float(reference_rate.mean())
+        active_mean = float((r["reference_increment"][..., 2] / r["interval"]).mean())
         rows.append(dict(condition=r.get("condition_id", condition_id(r["ell"])),
             ell=None if r.get("is_control") else r["ell"],
             strength=r.get("strength", r["metadata"]["dataset"]["strength"]),
@@ -679,7 +714,8 @@ def _save_summary(folder: Path, records: list[dict]) -> None:
                                       if abs(medium_mean) > 1e-10 else None),
             kneep_temporal_variance=float(predicted_rate.var(axis=-1, ddof=0).mean()),
             medium_temporal_variance=float(reference_rate.var(axis=-1, ddof=0).mean()),
-            active_mean_rate=float((r["reference_increment"][..., 2] / r["interval"]).mean())))
+            active_mean_rate=active_mean,
+            predicted_to_active_rate=float(repeat_means.mean()/active_mean) if abs(active_mean) > 1e-10 else None))
     control = next((row for row in rows if row["ell"] is None), None)
     if control is not None:
         for row in rows:
@@ -687,7 +723,7 @@ def _save_summary(folder: Path, records: list[dict]) -> None:
             row["medium_minus_no_long_range"] = row["medium_mean_rate"] - control["medium_mean_rate"]
     _write_json(folder / "evaluation" / "summary.json", dict(
         rows=rows, uncertainty="descriptive population SD (ddof=0); training-seed spread is conditional on fixed data, not a confidence interval",
-        reference="full-step midpoint medium EP; KNEEP infers sampled path irreversibility",
+        reference="primary reference: full-step midpoint active-only EP; medium columns are additional diagnostics",
     ))
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
@@ -711,49 +747,13 @@ def _execution_devices(args) -> tuple[str, ...]:
     count = args.workers if args.workers is not None else 1
     if count < 1:
         raise ValueError("--workers must be positive")
-    if target.type == "cuda" and count != 1:
-        raise ValueError("use --num-gpus N to select one worker per GPU")
     return (str(target),) * count
 
 
 def save_figures(records: list[dict], figure_dir: str | Path, *, show=False,
-                 window_steps=64) -> None:
-    """Save the overview and one readable report for each coupling strength."""
-    import matplotlib
-    if not show:
-        matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from utils.poisson_range_plots import (
-        plot_window_averaged_ep, plot_time_averaged_ep, plot_ep_spectrum,
-        plot_ep_performance, plot_training_history, plot_kernel_diagnostics,
-        plot_fluctuation_comparison, group_records_by_strength,
-    )
-    folder = Path(figure_dir)
-    folder.mkdir(parents=True, exist_ok=True)
-
-    def save(figure, path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(path, dpi=160, bbox_inches="tight")
-        print(f"Figure: {path}", flush=True)
-        if not show:
-            plt.close(figure)
-
-    save(plot_kernel_diagnostics(records), folder / "kernel_diagnostics.png")
-    save(plot_ep_performance(records), folder / "ep_performance.png")
-    for strength, group in group_records_by_strength(records, include_control=True).items():
-        destination = folder / f"g_{strength:g}"
-        for name, plot in (
-            ("training_history", plot_training_history),
-            ("time_averaged_ep", plot_time_averaged_ep),
-            ("fluctuation_comparison", plot_fluctuation_comparison),
-            ("ep_spectrum", plot_ep_spectrum),
-        ):
-            save(plot(group), destination / f"{name}.png")
-        save(plot_ep_spectrum(group, log_scale=True), destination / "ep_spectrum_log.png")
-        save(plot_window_averaged_ep(group, window_steps=window_steps),
-             destination / "window_averaged_ep.png")
-    if show:
-        plt.show()
+                 window_steps=64, include_medium=False) -> None:
+    from utils.poisson_g_plots import save_g_figures
+    save_g_figures(records, figure_dir, show=show, include_medium=include_medium)
 
 
 def export_movies(records, output_dir, *, fps=10, max_frames=64, required=False):
@@ -776,10 +776,10 @@ def export_movies(records, output_dir, *, fps=10, max_frames=64, required=False)
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", nargs="?", default="all",
-                        choices=("all", "generate", "train", "evaluate", "plot", "movies"))
-    parser.add_argument("--preset", choices=("quick", "demo", "refined", "production", "production_v2", "production_v3", "reference"),
-                        default="production_v3")
+    parser.add_argument("stage", nargs="?", default="training",
+                        choices=("all", "generate", "training", "train", "resume", "evaluate", "plot", "movies"))
+    parser.add_argument("--preset", choices=("quick", "demo", "production", "reference"),
+                        default="production")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--lramb-root", type=Path)
     placement = parser.add_mutually_exclusive_group()
@@ -787,15 +787,17 @@ def main(argv=None) -> None:
     placement.add_argument("--num-gpus", type=int,
                            help="one process per GPU, using the first N visible CUDA devices")
     parser.add_argument("--workers", type=int,
-                        help="CPU worker count, or cap the number of allocated GPU workers")
+                        help="parallel processes; with --device cuda may share one GPU (extra VRAM per worker)")
     parser.add_argument("--ells", nargs="+", type=float)
-    parser.add_argument("--strengths", nargs="+", type=float, help="positive g values crossed with every ell")
+    parser.add_argument("--strengths", "--g", nargs="+", type=float, help="signed g values crossed with every ell")
+    parser.add_argument("--dt", type=float)
+    parser.add_argument("--radius", type=float, help="tanh droplet radius; no mean shift")
     parser.add_argument("--noise", type=float, dest="D", help="conserved noise strength D")
     parser.add_argument("--mean", type=float, help="conserved mean field; domain_wall requires zero")
-    parser.add_argument("--initial-mode", choices=("stripe", "random", "domain_wall"))
+    parser.add_argument("--initial-mode", choices=("stripe", "random", "domain_wall", "tanh"))
     parser.add_argument("--include-no-interaction", action=argparse.BooleanOptionalAction,
                         default=None, help="include one g=0 no-long-range control")
-    parser.add_argument("--iterations", type=int)
+    parser.add_argument("--iterations", type=int, help="total target optimizer updates, including previous updates in resume")
     parser.add_argument("--repeats", type=int)
     parser.add_argument("--max-distance", type=int, help="maximum shell radius; 15 means a 31x31 outer stencil")
     parser.add_argument("--train-batch-size", type=int, help="logical number of transition pairs per optimizer step")
@@ -832,6 +834,7 @@ def main(argv=None) -> None:
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--figure-dir", type=Path, help="PNG destination for all/plot; default OUTPUT_DIR/figures")
     parser.add_argument("--show", action="store_true", help="also display figures interactively in all/plot")
+    parser.add_argument("--include-medium-map", action="store_true", help="add medium map with its own color scale")
     parser.add_argument("--window-steps", type=int, default=64, help="saved intervals per window in EP time plots")
     parser.add_argument("--no-movies", action="store_true", help="skip movie export after all/plot")
     parser.add_argument("--movie-fps", type=int, default=10)
@@ -842,17 +845,20 @@ def main(argv=None) -> None:
     if min(args.window_steps, args.movie_fps, args.movie_max_frames) < 1 or args.movie_trajectory < 0:
         parser.error("window steps, movie FPS and frame limit must be positive; movie trajectory must be nonnegative")
     torch.set_num_threads(args.cpu_threads)
-    default_output = (ROOT / "results" / "lramb_poisson_production_v3"
-                      if args.preset == "production_v3" else
-                      ROOT / "results" / "lramb_poisson_production_v2_range15"
-                      if args.preset == "production_v2"
+    default_output = (ROOT / "results" / "lramb_poisson_g_steady"
+                      if args.preset in {"g_steady", "production", "production_v2", "production_v3"}
                       else ROOT / "results" / "lramb_poisson_range" / args.preset)
     output = args.output_dir or default_output
     if args.stage in {"plot", "movies"}:
-        records = load_evaluation_records(output)
+        devices = _execution_devices(args)
+        saved_training = json.loads((output / 'training.json').read_text(encoding='utf-8'))
+        batch = args.batch_size or saved_training['config']['training']['prediction_batch_size']
+        records = evaluate_sweep(output, devices=devices, batch_size=batch,
+            cpu_threads=args.cpu_threads, movie_trajectory=args.movie_trajectory,
+            progress=not args.quiet, force=args.force)
         if args.stage == "plot":
             save_figures(records, args.figure_dir or output / "figures", show=args.show,
-                         window_steps=args.window_steps)
+                         window_steps=args.window_steps, include_medium=args.include_medium_map)
         if args.stage == "movies" or not args.no_movies:
             export_movies(records, output / "movies", fps=args.movie_fps,
                           max_frames=args.movie_max_frames, required=args.stage == "movies")
@@ -861,18 +867,30 @@ def main(argv=None) -> None:
         devices = _execution_devices(args)
     except (ValueError, RuntimeError) as error:
         parser.error(str(error))
-    data_config, fit_config = dataset_preset(args.preset), fit_preset(args.preset)
+    if args.stage == 'resume':
+        saved_training = json.loads((output / 'training.json').read_text(encoding='utf-8'))
+        saved_fit = saved_training['config']
+        fit_config = FitConfig(**{**saved_fit, 'training': TrainingConfig(**saved_fit['training'])})
+        data_config = DatasetConfig.from_dict(_complete_dataset(output)['config'])
+    else:
+        data_config, fit_config = dataset_preset(args.preset), fit_preset(args.preset)
     data_overrides = {name: getattr(args, name) for name in (
         "sample_every", "burn_steps", "production_steps", "train_trajectories",
         "validation_trajectories", "test_trajectories", "include_no_interaction",
         "D", "mean", "initial_mode", "movie_trajectories", "movie_window_steps",
-        "cuda_graph_steps",
+        "cuda_graph_steps", "dt", "radius",
     ) if getattr(args, name) is not None}
     if args.ells is not None:
         data_overrides["ells"] = tuple(args.ells)
     if args.strengths is not None:
         data_overrides["strengths"] = tuple(args.strengths)
+    if args.stage == 'resume' and (data_overrides or args.min_train_pairs is not None):
+        parser.error('resume reuses the saved dataset; do not supply generation overrides')
     data_config = replace(data_config, **data_overrides)
+    if data_config.initial_mode == "tanh" and args.mean is not None:
+        parser.error("--mean does not apply to tanh initialization; set --radius instead")
+    if args.preset in {"g_steady", "production", "production_v2", "production_v3"} and args.cuda_graph_steps is None and all(torch.device(d).type == "cuda" for d in devices):
+        data_config = replace(data_config, cuda_graph_steps=20)
     if args.min_train_pairs is not None:
         if args.min_train_pairs < 1:
             parser.error("--min-train-pairs must be positive")
@@ -896,18 +914,19 @@ def main(argv=None) -> None:
           f"logical batch={fit_config.training.train_batch_size}, "
           f"microbatch={fit_config.training.train_micro_batch_size}, "
           f"radius={fit_config.max_distance}, iterations={fit_config.training.iterations}")
-    if args.stage in {"all", "generate"}:
+    if args.stage in {"all", "generate", "training"}:
         print(f"Generation CUDA graph chunk: {data_config.cuda_graph_steps} "
               "(0=eager); saved frames transferred in chunks of up to 64")
     print(f"LR: {fit_config.training.lr_scheduler}; initial={fit_config.training.learning_rate:g}, "
           f"warmup={fit_config.training.lr_warmup_steps}, minimum={fit_config.training.lr_min:g}")
-    if args.stage in {"all", "generate"}:
+    if args.stage in {"all", "generate", "training"}:
         generate_sweep(data_config, output, lramb_root=args.lramb_root,
             devices=devices, cpu_threads=args.cpu_threads, force=args.force, progress=not args.quiet)
         print(f"Dataset ready: {output}")
-    if args.stage in {"all", "train"}:
+    if args.stage in {"all", "train", "training", "resume"}:
         train_sweep(output, fit_config, devices=devices, cpu_threads=args.cpu_threads,
-            shard_cache_size=args.shard_cache_size, force=args.force, progress=not args.quiet)
+            shard_cache_size=args.shard_cache_size, force=args.force, progress=not args.quiet,
+            resume=args.stage == 'resume')
         print(f"Training complete: {output}")
     if args.stage in {"all", "evaluate"}:
         records = evaluate_sweep(output, devices=devices, batch_size=prediction_batch,
@@ -918,7 +937,7 @@ def main(argv=None) -> None:
         print(f"Evaluation arrays: {output / 'evaluation'}; open demos/lramb_poisson_range.ipynb for inline plots")
         if args.stage == "all":
             save_figures(records, args.figure_dir or output / "figures", show=args.show,
-                         window_steps=args.window_steps)
+                         window_steps=args.window_steps, include_medium=args.include_medium_map)
             if not args.no_movies:
                 export_movies(records, output / "movies", fps=args.movie_fps,
                               max_frames=args.movie_max_frames)

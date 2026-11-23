@@ -24,7 +24,7 @@ import numpy as np
 from utils.poisson_range_plots import condition_label, condition_strength
 
 
-_MOVIES = ("profile", "medium", "predicted")
+_MOVIES = ("profile", "active", "predicted")
 
 
 def _array(value: Any) -> np.ndarray:
@@ -34,30 +34,30 @@ def _array(value: Any) -> np.ndarray:
 
 
 def _movie_data(record: Mapping[str, Any]) -> dict[str, np.ndarray]:
-    required = ("movie_fields", "movie_medium_rate", "movie_predicted_rate", "movie_time")
+    required = ("movie_fields", "movie_active_rate", "movie_predicted_rate", "movie_time")
     missing = [key for key in required if key not in record]
     if missing:
         raise ValueError("Cached movie arrays are missing: " + ", ".join(missing)
-                         + ". Run evaluation with movie caching enabled before requesting movies.")
+                         + ". Generate full-step active movie maps and evaluate first; legacy medium-only caches cannot supply active movies.")
     fields = _array(record["movie_fields"])
-    medium = _array(record["movie_medium_rate"])
+    active = _array(record["movie_active_rate"])
     predicted = _array(record["movie_predicted_rate"])
     if predicted.ndim == 4:
         if not predicted.shape[0]:
             raise ValueError("At least one fitted model is required for a predicted movie")
         predicted = predicted.mean(axis=0)  # Average independent fits only.
     time = _array(record["movie_time"])
-    if (fields.ndim != 3 or not fields.shape[0] or medium.shape != fields.shape
+    if (fields.ndim != 3 or not fields.shape[0] or active.shape != fields.shape
             or predicted.shape != fields.shape or time.shape != (fields.shape[0],)):
         raise ValueError("Movie arrays must share [frame,y,x]; predictions may additionally have a fit-seed axis")
-    if any(not np.isfinite(value).all() for value in (fields, medium, predicted, time)):
+    if any(not np.isfinite(value).all() for value in (fields, active, predicted, time)):
         raise ValueError("Movie arrays must be finite")
     if np.any(np.diff(time) <= 0):
         raise ValueError("Cached movie times must be strictly increasing")
     interval = float(record["interval"])
     if not np.isfinite(interval) or interval <= 0:
         raise ValueError("The saved observation interval must be positive and finite")
-    result = dict(profile=fields, medium=medium, predicted=predicted, time=time)
+    result = dict(profile=fields, active=active, predicted=predicted, time=time)
     for key in ("movie_window_start", "movie_window_end", "movie_field_time"):
         if key in record:
             value = _array(record[key])
@@ -90,14 +90,14 @@ def animate_test_trajectory(
 ) -> FuncAnimation:
     """Animate the evaluator's cached test trajectory, with fixed color limits.
 
-    ``movie`` is profile, medium, predicted, or combined (three synchronized
+    ``movie`` is profile, active, predicted, or combined (three synchronized
     panels). Profile times are EP-window endpoints. EP timestamps are window
     centers and are explicitly labelled as window averages. ``max_frames``
     selects evenly spaced existing frames; it does not interpolate dynamics.
     Signed logarithmic colors apply only to EP maps; field colors stay linear.
     """
     if movie not in (*_MOVIES, "combined"):
-        raise ValueError("movie must be profile, medium, predicted or combined")
+        raise ValueError("movie must be profile, active, predicted or combined")
     if not np.isfinite(interval_ms) or interval_ms <= 0:
         raise ValueError("interval_ms must be positive and finite")
     if max_frames is not None and (isinstance(max_frames, bool) or not isinstance(max_frames, int) or max_frames < 1):
@@ -113,7 +113,7 @@ def animate_test_trajectory(
         raise ValueError("dx must be positive and finite")
     height, width = data["profile"].shape[-2:]
     extent = (0, width * dx, 0, height * dx)
-    titles = {"profile": "Field profile phi", "medium": "Direct midpoint medium EP",
+    titles = {"profile": "Field profile phi", "active": "Active-only midpoint EP",
               "predicted": "KNEEP EP (fit-seed mean)"}
     artists = []
     for ax, mode in zip(axes.flat, modes):
@@ -129,7 +129,7 @@ def animate_test_trajectory(
         artists.append(artist)
     time_label = fig.text(0.5, 0.055, "", ha="center", fontsize=9)
     fig.suptitle(condition_label(record), fontsize=12)
-    fig.text(0.5, 0.012, "Fixed signed color limits; EP maps are window averages. Learned and medium entropy gauges differ.",
+    fig.text(0.5, 0.012, "Fixed signed color limits; EP maps are window averages. Active-only reference; EP maps are integrated over every solver step.",
              ha="center", fontsize=8)
     fig.tight_layout(rect=(0, 0.12, 1, 0.94))
 
@@ -179,7 +179,7 @@ def save_test_movies(
     max_frames: int | None = 64,
     combined: bool = False,
 ) -> list[Path]:
-    """Export profile, medium-EP and learned-EP videos for each cached condition.
+    """Export profile, active-EP and learned-EP videos for each cached condition.
 
     MP4 uses ffmpeg when Matplotlib can find it; otherwise the same frames are
     saved as Pillow GIFs. A failed ffmpeg encoding also falls back to GIF. Set

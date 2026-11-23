@@ -244,259 +244,128 @@ Use absolute config/output paths: the job changes directory to
 before the filename, e.g. `sbatch --mem=32G scripts/lramb_single_run.slurm`.
 The job has not been submitted or executed as part of this change.
 
-The default `production_v3` compares **13 conditions**:
-`g=(0.5,1,2) x ell=(1,2,4,8)` plus one `g=0` control. The Poisson multiplier is
-`Khat(q)=exp(-ell*q)` for nonzero q and `Khat(0)=0`. The control retains local
-bulk, gradient and active terms. Matching trajectory numbers share initial
-conditions and noise seeds across conditions within one backend; train,
-validation and test use independent seeds.
+### Predicted and active-only EPR versus g (default)
 
-### Production v3 settings
+`lramb_poisson_range.py` now defaults to `--preset production`:
 
-| Setting | Value |
-| --- | --- |
-| Grid / solver step / saved-pair stride | 32 x 32 / 0.01 / 1 |
-| Couplings / interaction lengths | g=0.5,1,2 / ell=1,2,4,8, plus one g=0 |
-| Noise / conserved mean | D=0.1 / mean=0 |
-| Physical parameters | a=-1, b=kappa=M=1, lambda=0.8 |
-| Initial field | Periodic slab, interfaces at L/4 and 3L/4 |
-| Burn / production steps per trajectory | 16,000 / 1,024 |
-| Burn / production physical time | 160 / 10.24 |
-| Independent train / validation / test trajectories per condition | 1,024 / 64 / 128 |
-| Adjacent train pairs per condition | **1,048,576** |
-| Maximum shell radius / hidden width / depth | 15 (31 x 31 stencil) / 32 / 2 |
-| Logical batch / GPU microbatch | 1,024 / 128 |
-| AdamW initial LR / weight decay | 1e-3 / 1e-4 |
-| Iterations / fit seeds / full-validation interval | 10,000 / 3 / 250 iterations |
-| LR scheduler | ReduceLROnPlateau on full validation loss |
-| Plateau factor / patience / cooldown | 0.5 / 3 events / 1 event |
-| Absolute improvement threshold / minimum LR / warmup | 1e-3 / 1e-5 / 0 |
-| Movie trajectories / averaging window | First test trajectory / 16 observed intervals |
+- g = -0.2, -0.1, -0.04, -0.02, 0, 0.02, 0.04; ell = 2.
+- dt = 0.01, burn-in = 2,000,000 steps (physical time 20,000).
+- n=64, dx=1, a=-0.25, b=0.25, kappa=1, lambda=1, zeta=0, D=0.1.
+- Initial field: radius-16 tanh droplet, with its geometric mean conserved
+  (about -0.5972084); no shift to the config's random/stripe `mean` parameter.
+- Per g: 32 train, 4 validation, 5 test trajectories; 8192 production steps
+  (time 81.92), every adjacent pair retained. These defaults retain about
+  36 GiB of raw field data over seven conditions, before other artifacts.
+- Five independent fits per g; 10000 updates, logical batch 8192,
+  microbatch 1024, hidden channels 64, two hidden layers, no LR scheduler,
+  branch radius 6 (7 branches, radii 0 through 6). EP is inferred from the existing
+  unsupervised objective; reference EP is used only for evaluation.
 
-The initial bulk values are `+/-sqrt(-a/b)` (here +/-1), with diffuse interfaces
-and exactly conserved mean zero. The wall is initialized **before burn-in**;
-it can relax or disappear before production. Inspect production fields rather
-than assuming the wall survives. Adjacent pairs remain correlated; more
-independent trajectories improve ensemble coverage, but production time 10.24
-limits slow-mode conclusions.
-
-Plateau scheduling retains its current LR while validation improves. It uses an
-**absolute** improvement threshold because the alpha loss is negative. PyTorch
-`patience=3` reduces LR after **four** consecutive insufficient improvements;
-cooldown suppresses counting for one event. The scheduler sees each complete
-validation once and is independent of gradient microbatches. Checkpoint history
-stores LR used by the update and LR after validation. Batch 1024 uses eight
-microbatches of 128; `--train-micro-batch-size 1024` needs sufficient VRAM.
-
-New output: `KNEEP/results/lramb_poisson_production_v3/`.
-Large v3 generation and training have not been run in this workspace.
-
-### Run stages independently or together
-
-From the parent workspace:
+Run from KNEEP (or use the updated four-GPU SLURM script):
 
 ```bash
-python -m pip install -r KNEEP/requirements.txt
-python KNEEP/scripts/lramb_poisson_range.py all --preset production_v3 --num-gpus 4 --cpu-threads 1
-
-python KNEEP/scripts/lramb_poisson_range.py generate --preset production_v3 --num-gpus 4
-python KNEEP/scripts/lramb_poisson_range.py train --preset production_v3 --num-gpus 4
-python KNEEP/scripts/lramb_poisson_range.py evaluate --preset production_v3 --num-gpus 4
-
-# CPU: cached results only, no training or inference.
-python KNEEP/scripts/lramb_poisson_range.py plot --preset production_v3
-# Export only cached profile, medium-EP and KNEEP-EP movies:
-python KNEEP/scripts/lramb_poisson_range.py movies --preset production_v3
+python scripts/lramb_poisson_range.py training --num-gpus 4
+python scripts/lramb_poisson_range.py plot --num-gpus 4
+sbatch scripts/lramb_poisson_range.slurm training
 ```
 
-Only generation needs LRAMB (`--lramb-root PATH` overrides its location).
-Compatible completed trajectory shards and fits are reused. Incompatible settings
-need a new `--output-dir` or explicit `--force`. An interrupted unfinished fit
-repeat restarts; completed repeats remain available.
+Workers train independent models, starting different g conditions first.
+With one GPU use `--device cuda --workers 2` to run two concurrent processes
+if VRAM permits; each has its own model and optimizer. `--device cuda`
+alone uses one worker, scheduling conditions sequentially. CPU parallelism
+uses `--device cpu --workers 2`. CUDA burn-in automatically uses graph chunks
+of 20 steps for this preset; `--cuda-graph-steps 0` disables it.
 
-Explicit physical and optimizer options:
+The new default output is `results/lramb_poisson_g_steady`. Figures are:
+
+- Per condition: `loss.png`, `ep_maps.png`, `branch_ep_average.png`,
+  `branch_ep_fluctuation.png`, `branch_ep_fluctuation_per_pixel.png`.
+- Across g: `branch_fluctuation_overlay.png`,
+  `branch_fluctuation_overlay_normalized.png`, `epr_vs_g.png`,
+  `pred_true_ratio_vs_g.png`.
+- Numeric values: `branch_statistics.csv`, `epr_vs_g.csv`, and definitions
+  in `definitions.json`.
+- Test trajectory 0: separate profile, predicted-EP and active-only-EP
+  MP4 videos (GIF fallback without ffmpeg). EP frames average 100 solver
+  steps; the export selects at most 64 evenly spaced cached frames.
+
+Active-only reference maps are accumulated at every float64 solver step,
+including steps between saved observations. All maps use EP/time/site.
+Predicted and active maps share a color scale; `--include-medium-map` adds
+a medium map with a separate scale. Maps average time, test trajectories,
+and (for prediction) independent fits.
+
+Branch fluctuation is the temporal variance of saved-interval EPR *within*
+each trajectory, then averaged over trajectories/fits. Pixel correction
+divides by the square of the actual branch force-input pixel count. The
+normalized overlay divides variance by the square of the ensemble mean
+total predicted EPR. This equals the variance of the normalized rate;
+near-zero denominators produce NaN. Both overlays include raw and per-pixel
+panels. Fluctuations depend on the observation interval.
+
+EPR error bars are SEM across test-trajectory means after averaging fits;
+fit-seed SEM is reported separately in CSV. The ratio is a ratio of ensemble
+means, not an average of noisy individual ratios. The active-only rate is
+the primary reference; no system-entropy correction is added.
+
+Stages are separate: `training` (the default) generates/reuses data and fits,
+without evaluation or rendering; `train` only fits an existing dataset.
+`plot` evaluates the latest saved best models (reusing matching evaluation
+arrays), then writes figures and movies, without simulation or training.
+`all` remains available for the entire pipeline. Use the same `--output-dir`
+for every stage. To render without simulation/training:
 
 ```bash
-python KNEEP/scripts/lramb_poisson_range.py all --preset production_v3 --num-gpus 4 \
-  --strengths 0.5 1 2 --ells 1 2 4 8 --noise 0.1 --initial-mode domain_wall \
-  --train-trajectories 1024 --validation-trajectories 64 --test-trajectories 128 \
-  --production-steps 1024 --sample-every 1 --max-distance 15 \
-  --train-batch-size 1024 --train-micro-batch-size 128 --iterations 10000 \
-  --learning-rate 1e-3 --weight-decay 1e-4 --lr-scheduler plateau \
-  --validate-every 250 --lr-plateau-factor 0.5 --lr-plateau-patience 3 \
-  --lr-plateau-threshold 1e-3 --lr-plateau-cooldown 1 --lr-min 1e-5 \
-  --lr-warmup-steps 0 --movie-trajectories 1 --movie-window-steps 16
+python scripts/lramb_poisson_range.py plot --no-movies --include-medium-map
+python scripts/lramb_poisson_range.py movies
 ```
 
-Legacy profiles remain available. `production_v2` keeps its previous physical
-parameters and cosine schedule in `KNEEP/results/lramb_poisson_production_v2_range15/`.
-Other legacy profiles use `KNEEP/results/lramb_poisson_range/<preset>/`.
-
-| Preset | Grid | Burn / production steps | Train / val / test | Fits x iterations |
-| --- | --- | --- | --- | --- |
-| quick | 8 x 8 | 16 / 64 | 2 / 1 / 2 | 2 x 4 |
-| demo | 32 x 32 | 4,000 / 8,192 | 4 / 2 / 3 | 3 x 2,000 |
-| refined | 32 x 32 | 16,000 / 8,192 | 8 / 4 / 4 | 3 x 20,000 |
-| production | 32 x 32 | 16,000 / 8,192 | 128 / 4 / 4 | 3 x 10,000 |
-| production_v2 | 32 x 32 | 16,000 / 8,192 | 256 / 8 / 4 | 3 x 10,000 |
-| production_v3 (default) | 32 x 32 | 16,000 / 1,024 | 1,024 / 64 / 128 | 3 x 10,000 |
-| reference | 64 x 64 | 40,000 / 64,000 | 4 / 2 / 3 | 5 x 5,000 |
-
-Legacy profiles use D=0.05, mean=-0.2, g=0.35 and stripe initialization;
-production/v2 also include g=0. `quick` checks execution only.
-`--batch-size` changes evaluation batches; `--train-batch-size` changes training.
-`--min-train-pairs` raises train trajectory count for a custom cadence.
-
-### Figures and movies
-
-`all` and `plot` export global kernel/performance figures and comparisons grouped
-by g, with the same g=0 control in each group. The four interaction lengths are
-overlaid directly. Main figures include:
-
-- Two-dimensional signed kernel maps.
-- Full-validation learning curves and recorded LR changes.
-- EP rates in consecutive windows (`--window-steps 64`).
-- Mean EP per observed step and KNEEP/direct-medium mean-rate ratio.
-- Signed shell means, raw temporal variances, and pixel-normalized variances
-  (three columns): `ep_spectrum.png`
-  uses linear mean EP; `ep_spectrum_log.png` uses signed logarithmic mean EP.
-  Symlog retains negative/zero EP with a linear region within +/-1e-8;
-  the radius axis stays linear including rho=0. Variance uses symlog in both.
-- Overlaid Var(j_rho) and Var(j_rho)/N_rho^2 in separate method rows.
-  N counts force-input pixels from each branch mask: 1, 8, 16, 24, ... .
-  The physical reference uses its own periodic shell sizes.
-- Time-averaged EP maps with linear colors.
-
-The fluctuation figure includes rho=0 (N=1) and shows individual branches. Temporal
-variance is calculated within each trajectory. KNEEP bands show fit-seed SD
-following trajectory averaging; medium bands show test-trajectory SD. These are
-descriptive spreads, not confidence intervals. Signed colors preserve negative EP.
-
-Movies show profile, full-step midpoint medium EP and predicted KNEEP EP for one
-saved held-out trajectory per condition. Medium maps average every solver-step
-contribution in each saved movie window; they are not endpoint reconstructions.
-Predicted maps use matching observed pairs and window durations. MP4 is selected
-when FFmpeg is available, otherwise GIF. Defaults:
-`--movie-trajectory 0 --movie-fps 10 --movie-max-frames 64`.
-`--no-movies` skips export. Retaining other medium-EP trajectories requires
-setting `--movie-trajectories` during generation.
-
-Figures go to `<output-dir>/figures/`; `--figure-dir PATH` overrides this.
-The notebook constructs inline figures and a selected cached movie using
-`HTML(animation.to_jshtml())`. After fresh notebook training set
-`EVALUATE_NEW=True` explicitly; missing caches never silently launch training
-or inference. Legacy arrays have no medium-EP movie windows but can still be
-plotted numerically:
+Extend an existing fit to a **total** of 20,000 optimizer updates:
 
 ```bash
-python KNEEP/scripts/lramb_poisson_range.py plot \
-  --output-dir KNEEP/results/lramb_poisson_range/production --no-movies
+python scripts/lramb_poisson_range.py resume --iterations 20000 --num-gpus 4
+python scripts/lramb_poisson_range.py plot --num-gpus 4
+# SLURM equivalents (submit plot after resume finishes):
+sbatch scripts/lramb_poisson_range.slurm resume --iterations 20000
+sbatch scripts/lramb_poisson_range.slurm plot
 ```
 
-Keep `dataset.json` and `training.json` beside `evaluation/*.npz`. Cached-only
-loading validates historical provenance, without requiring today's source hash,
-CUDA, training movies or checkpoints.
+`resume` loads the original fit configuration from training.json, so the
+original preset/model settings need not be repeated. Only the iteration
+target may change; data, branch radius, batch size, repeat count, and optimizer
+settings remain fixed. No trajectories are regenerated. Without --iterations,
+resume continues an interrupted run toward its saved target. Completed repeats
+are reused, unfinished repeats resume from their latest validation checkpoint,
+and repeats that never started begin normally.
 
-### Parallel execution, RAM and SLURM
+New `repeat_*.last.pt` checkpoints save the last model, AdamW state, plateau
+scheduler, sampling/global RNG states, normalization, full loss history, and
+best model at each validation event. Evaluation continues to use the best
+validation model across the entire training history. Cosine extension retains
+its original schedule horizon and stays at lr_min beyond that horizon.
 
-`--num-gpus 4` assigns independent jobs to one process per visible GPU.
-Generation, condition/fit-seed training and condition evaluation run in parallel.
-Each fit uses one GPU; VRAM is not combined. Use `--workers` to cap concurrency
-or `--device cpu --workers 4` for CPU workers.
+Historical best-only checkpoints cannot recover optimizer/RNG state that was
+never saved: resume automatically continues from their best weights with a
+fresh optimizer and RNG, and logs `legacy best-weight continuation`. This is
+further fitting, not an exact restoration of the historical trajectory.
 
-Generation first runs **one joint burn batch per physical condition**, combining
-train, validation and test (1024+64+128 = 1216 members for production_v3).
-Only current fields are resident during burn-in. Each condition saves
-`data/<condition>/burn_state.pt`; production trajectory tasks then read their
-own terminal field, without repeating burn-in. Conditions can burn on separate
-GPUs; a barrier separates the burn phase from distributed production.
-Matching completed burn checkpoints and production shards are reused on restart.
-The ordered batch and separate production streams are reproducible across
-conditions within a backend. Changing split counts changes the burn noise sequence.
+Old datasets without `active_rate_maps` can still produce static active
+maps, but need fresh generation to produce exact full-step active movies.
+Completed stage artifacts are reused when signatures match. Burn-in checkpoints are saved at completion of
+each condition, not periodically inside its 2-million-step burn.
 
-For small-grid generation, the CPU can spend most of its time launching tiny
-CUDA kernels. An optional burn-in graph runs up to 100 full Euler-Maruyama steps
-per replay, operating on the entire condition's batch:
+Small end-to-end validation:
 
 ```bash
-# From the KNEEP directory, inside an activated Python environment / tmux:
-python -u scripts/lramb_poisson_range.py all --preset production_v3 \
-  --num-gpus 2 --cpu-threads 1 --cuda-graph-steps 64 \
-  --output-dir results/lramb_poisson_production_v3_graph64 \
-  2>&1 | tee production_v3_graph64.log
+python scripts/lramb_poisson_range.py all --preset quick --g -0.02 0 0.02 --ells 2 --movie-trajectories 1 --movie-window-steps 8 --movie-max-frames 3 --device cpu --workers 2 --output-dir results/g_fit_smoke
+python -m unittest discover -s tests -p test_poisson_g_sweep.py -v
 ```
 
-The option defaults to 0 (eager), requires CUDA graph support including custom
-generator registration, and is included in dataset provenance. Every burn-in
-step still computes its own noise and real-space drift. A diagnostic spectrum
-is constructed once at the end. The custom generator advances on every replay;
-warmup does not consume the burn RNG stream.
-Production retains every-step midpoint EP. Saved fields are staged in a bounded
-64-frame device buffer before copying to CPU. Each generated trajectory reports
-production seconds and steps/s, including reference checks and writing the shard.
-Joint burn-in timing is reported separately and includes graph warmup/capture.
-
-The graph path has not been executed or benchmarked on CUDA in the development
-environment. Capture errors propagate; restart with `--cuda-graph-steps 0` in a
-separate output directory if the installed CUDA/PyTorch stack cannot capture it.
-Generator source changes invalidate older generation signatures. Use a new
-output directory for this revision; keep existing shards rather than using
-`--force` on a running/previous dataset. Existing completed datasets remain
-loadable for training/evaluation. Do not launch old and new generators into the
-same output directory.
-
-Trajectory shards use `torch.load(..., mmap=True)` and pairs are fetched without
-copying the full dataset to RAM/GPU. V3 float32 field movies occupy about
-**4.30 GB per train condition**, **55.9 GB for all 13 train conditions**, or
-**66.4 GB including val/test**. References, diagnostics, movie windows and
-checkpoints add storage. OS page cache counts toward RAM, so mapping cannot
-promise a fixed peak. The default mapping cache remains 128. An optional
-`--shard-cache-size 2` limits retained mappings but can cause substantial file
-reopening and metadata I/O for random batches across 1,024 trajectories.
-SLURM `--mem` requests host RAM, not GPU VRAM.
-
-Submit [scripts/lramb_poisson_range.slurm](scripts/lramb_poisson_range.slurm):
-
-```bash
-cd /pds/pds1/slurm_workspace/idh1203/KNEEP
-sbatch scripts/lramb_poisson_range.slurm
-# Check measured peak RAM before adopting a lower request:
-sbatch --mem=16G scripts/lramb_poisson_range.slurm --shard-cache-size 2
-```
-
-The script requests four GPUs/four CPUs, excludes gpu1, sets the supplied cache,
-and runs `all --preset production_v3`. Python defaults to
-`/pds/pds0/home/idh1203/anaconda3/envs/kneep/bin/python`; set `KNEEP_PYTHON` before
-submission to override it. The script checks the executable before `srun`.
-No job has been submitted from this workspace.
-
-### Interpretation and numerical checks
-
-The reference is **medium entropy**, excluding stochastic system entropy.
-KNEEP estimates observed-pair irreversibility. Their finite-time maps and shell
-fluctuations have different boundary terms and force gauges: direct midpoint
-medium EP is not exact stationary total EP. At stationarity mean system-entropy
-boundary increments vanish, so a persistent mean-rate gap cannot be assigned
-solely to that boundary.
-
-Additive Chebyshev-shell branches are architecture-dependent, not unique
-physical interactions. General center-neighbor products may be unrepresentable.
-Radius 15 on n=32 excludes the opposite radius-16 row/column; physical reference
-shells include the entire lattice. Each conservative quadratic shell is a
-free-energy boundary difference. Increasing ell at fixed g also attenuates every
-nonzero Fourier mode. Monotonic EP/fluctuation trends are not assumed. Check
-structural drift, timestep sensitivity and independent data replicates before
-claiming stationary scaling or exact recovery. See
-[Otsubo et al. (2022)](https://www.nature.com/articles/s42005-021-00787-x) and
-[Kwon and Baek (2024)](https://doi.org/10.1103/PhysRevE.109.014143)
-for estimator assumptions.
-
-Generator revision: `canonical-fourier-v4-strengths-wall-movies`.
-FFT(real field) is recomputed after every Euler step, supplying a consistent
-spectrum for the next drift, midpoint entropy and shell endpoint energies.
-Kernel-shell sums are checked per trajectory before finalizing the split.
-Reported CUDA assertion failures were not reproduced locally; tolerances were
-not relaxed. New physical settings require a fresh v3 directory.
+The CLI presets are `production`, `quick`, `demo`, and `reference`.
+Current production uses max_distance=6. Existing result files are retained;
+resume reads the original fit configuration from the saved training manifest
+and is independent of subsequent preset edits. To change model architecture
+rather than extend training, use a fresh output directory.
 
 ### Batched stationary g sweep (no fitting)
 

@@ -221,4 +221,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-/tests/
+/tests/*
+!/tests/test_poisson_g_sweep.py

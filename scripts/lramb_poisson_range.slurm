@@ -26,16 +26,23 @@ export NUMEXPR_NUM_THREADS=1
 
 # One SLURM task starts one experiment worker per visible GPU. Each model is
 # fitted on one GPU; condition/fit-seed jobs run independently in parallel.
-# production_v3: g=(0.5,1,2) x ell=(1,2,4,8), plus one g=0 control.
-# D=0.1, mean=0, periodic +/-1 domain-wall initialization BEFORE burn-in.
-# 1024 train/64 validation/128 test trajectories x 1024 observed pairs;
-# radius 15, logical batch 1024, microbatch 128, 10,000 AdamW updates.
-# LR starts at 1e-3 and halves only on a validation plateau (floor 1e-5).
-# all saves evaluation arrays, grouped PNGs and profile/medium/KNEEP movies.
+# production: g=(-.2,-.1,-.04,-.02,0,.02,.04), ell=2.
+# n=64, D=.1, tanh droplet radius=16, no mean shift.
+# dt=.01, burn=2,000,000 steps; 32 train/4 validation/5 test trajectories.
+# 8192 production steps, radius 6, logical batch 8192, microbatch 1024.
+# Five fits per g, hidden channels 64; constant LR=1e-3.
+# Default: generation + training only. Pass plot or resume as first argument.
 # Override host RAM or retained mmap cache explicitly when submitting;
 # a smaller cache does not guarantee a lower RAM peak and increases file I/O.
-srun --ntasks=1 "$PYTHON" -u lramb_poisson_range.py all \
-  --preset production_v3 \
+STAGE=training
+case "${1:-}" in
+  all|generate|training|train|resume|evaluate|plot|movies)
+    STAGE="$1"
+    shift
+    ;;
+esac
+srun --ntasks=1 "$PYTHON" -u lramb_poisson_range.py "$STAGE" \
+  --preset production \
   --num-gpus 4 \
   --cpu-threads 1 \
   "$@"

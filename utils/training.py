@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Integral
 
 import numpy as np
@@ -87,6 +87,7 @@ class TrainingResult:
     # Optimizer LR immediately after each recorded validation event. Plateau
     # reductions are visible here before their use by the following update.
     next_learning_rates: tuple[float, ...] = ()
+    resume_state: dict | None = None
 
 
 def _learning_rate_at_iteration(config: TrainingConfig, iteration: int) -> float:
@@ -196,6 +197,8 @@ def train_model(
     ep_component_indices: tuple[int, ...] | None = None,
     activation: str = "elu",
     normalization: tuple[torch.Tensor, torch.Tensor] | None = None,
+    resume_state: dict | None = None,
+    checkpoint_callback=None,
 ) -> TrainingResult:
     """Fit on a dense movie or memory-mapped independent trajectory shards.
 
@@ -252,6 +255,8 @@ def train_model(
             cooldown=config.lr_plateau_cooldown, min_lr=config.lr_min,
         )
 
+    if resume_state is not None:
+        normalization = (resume_state['mean'], resume_state['std'])
     if normalization is None:
         mean_cpu, std_cpu = channel_normalization(train_video)
     else:
@@ -273,9 +278,68 @@ def train_model(
     validation_losses: list[float] = []
     learning_rates: list[float] = []
     next_learning_rates: list[float] = []
+    start_iteration = 1
+    schedule_iterations = config.iterations
+    if resume_state is not None:
+        start_iteration = int(resume_state['iteration']) + 1
+        if start_iteration > config.iterations + 1:
+            raise ValueError('Target iterations precede the saved iteration')
+        model.load_state_dict(resume_state['model_state'])
+        if resume_state.get('optimizer_state') is not None:
+            optimizer.load_state_dict(resume_state['optimizer_state'])
+        if plateau_scheduler is not None and resume_state.get('scheduler_state') is not None:
+            plateau_scheduler.load_state_dict(resume_state['scheduler_state'])
+        if resume_state.get('sampler_state') is not None:
+            sampler.set_state(resume_state['sampler_state'].cpu())
+        if resume_state.get('torch_rng_state') is not None:
+            torch.set_rng_state(resume_state['torch_rng_state'].cpu())
+        if target.type == 'cuda' and resume_state.get('cuda_rng_state') is not None:
+            torch.cuda.set_rng_state(resume_state['cuda_rng_state'].cpu(), target)
+        if resume_state.get('python_rng_state') is not None:
+            random.setstate(resume_state['python_rng_state'])
+        if resume_state.get('numpy_rng_state') is not None:
+            ns = resume_state['numpy_rng_state']
+            np.random.set_state((ns[0], np.asarray(ns[1], dtype=np.uint32), *ns[2:]))
+        best_loss = resume_state['best_validation_loss']
+        best_iteration = resume_state['best_iteration']
+        best_learning_rate = resume_state['best_learning_rate']
+        best_state = resume_state['best_model_state']
+        history_iterations = list(resume_state['history_iterations'])
+        train_losses = list(resume_state['train_losses'])
+        validation_losses = list(resume_state['validation_losses'])
+        learning_rates = list(resume_state['learning_rates'])
+        next_learning_rates = list(resume_state['next_learning_rates'])
+        schedule_iterations = resume_state.get('schedule_iterations', config.iterations)
+
+    def cpu_copy(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {k: cpu_copy(v) for k, v in value.items()}
+        if isinstance(value, (tuple, list)):
+            return type(value)(cpu_copy(v) for v in value)
+        return value
+
+    def snapshot(iteration):
+        ns = np.random.get_state()
+        return dict(schema=1, iteration=iteration, model_state=cpu_copy(model.state_dict()),
+            optimizer_state=cpu_copy(optimizer.state_dict()),
+            scheduler_state=plateau_scheduler.state_dict() if plateau_scheduler else None,
+            sampler_state=sampler.get_state(), torch_rng_state=torch.get_rng_state(),
+            cuda_rng_state=torch.cuda.get_rng_state(target) if target.type == 'cuda' else None,
+            python_rng_state=random.getstate(), numpy_rng_state=(ns[0], ns[1].tolist(), *ns[2:]),
+            mean=mean.detach().cpu().clone(), std=std.detach().cpu().clone(),
+            best_model_state=cpu_copy(best_state), best_iteration=best_iteration,
+            best_validation_loss=best_loss, best_learning_rate=best_learning_rate,
+            history_iterations=list(history_iterations), train_losses=list(train_losses),
+            validation_losses=list(validation_losses), learning_rates=list(learning_rates),
+            next_learning_rates=list(next_learning_rates), schedule_iterations=schedule_iterations)
+
+    last_state = resume_state
+    schedule_config = replace(config, iterations=schedule_iterations)
 
     iterator = trange(
-        1,
+        start_iteration,
         config.iterations + 1,
         desc="KNEEP training",
         leave=False,
@@ -285,7 +349,9 @@ def train_model(
         # Once warmup finishes, plateau owns the optimizer LR. Reassigning
         # the base rate here would silently undo every validation reduction.
         if plateau_scheduler is None or iteration <= config.lr_warmup_steps:
-            scheduled_rate = _learning_rate_at_iteration(config, iteration)
+            # Extension preserves the original cosine horizon, holding lr_min
+            # past its endpoint instead of silently restarting the schedule.
+            scheduled_rate = _learning_rate_at_iteration(schedule_config, min(iteration, schedule_iterations))
             for param_group in optimizer.param_groups:
                 param_group["lr"] = scheduled_rate
         learning_rate = float(optimizer.param_groups[0]["lr"])
@@ -346,6 +412,10 @@ def train_model(
                     name: value.detach().cpu().clone()
                     for name, value in model.state_dict().items()
                 }
+            if checkpoint_callback is not None or iteration == config.iterations:
+                last_state = snapshot(iteration)
+                if checkpoint_callback is not None:
+                    checkpoint_callback(last_state)
 
     if best_state is None:
         raise RuntimeError("training finished without a validation checkpoint")
@@ -363,6 +433,7 @@ def train_model(
         learning_rates=tuple(learning_rates),
         best_learning_rate=best_learning_rate,
         next_learning_rates=tuple(next_learning_rates),
+        resume_state=last_state,
     )
 
 

@@ -24,7 +24,7 @@ import torch
 
 
 SCHEMA_VERSION = 2
-GENERATOR_REVISION = "tjhung-real-space-v2-joint-burn"
+GENERATOR_REVISION = "tjhung-real-space-v3-active-g-sweep"
 CHANNEL_NAMES = ("local conservative", "kernel conservative", "local active")
 SPLITS = ("train", "validation", "test")
 _SEED_OFFSETS = {"train": 0, "validation": 100_000, "test": 200_000}
@@ -63,6 +63,7 @@ class DatasetConfig:
     test_trajectories: int = 3
     base_seed: int = 17
     initial_mode: str = "stripe"
+    radius: float = 16.0
     movie_trajectories: int = 0
     movie_window_steps: int = 16
     # Explicit opt-in; 0 keeps eager burn-in. Part of dataset provenance.
@@ -73,11 +74,11 @@ class DatasetConfig:
         if self.strengths is not None:
             object.__setattr__(self, "strengths", tuple(float(x) for x in self.strengths))
             if (not self.strengths or len(set(self.strengths)) != len(self.strengths)
-                    or any(not math.isfinite(x) or x <= 0 for x in self.strengths)):
-                raise ValueError("strengths must contain distinct positive finite couplings")
-        if (len(self.ells) < 2 or len(set(self.ells)) != len(self.ells)
+                    or any(not math.isfinite(x) for x in self.strengths)):
+                raise ValueError("strengths must contain distinct finite couplings")
+        if (not self.ells or len(set(self.ells)) != len(self.ells)
                 or any(not math.isfinite(x) or x <= 0 for x in self.ells)):
-            raise ValueError("ells must contain at least two distinct positive finite ranges")
+            raise ValueError("ells must contain distinct positive finite ranges")
         integer_fields = ("n", "burn_steps", "production_steps", "sample_every", "blocks",
                           "train_trajectories", "validation_trajectories", "test_trajectories",
                           "base_seed", "movie_trajectories", "movie_window_steps", "cuda_graph_steps")
@@ -105,8 +106,11 @@ class DatasetConfig:
                 raise ValueError(f"{name} must be finite")
         if min(self.dx, self.dt, self.b, self.mobility, self.D) <= 0 or self.kappa < 0:
             raise ValueError("dx, dt, b, mobility, D must be positive; kappa >= 0")
-        if self.initial_mode not in {"stripe", "random", "domain_wall"}:
-            raise ValueError("initial_mode must be stripe, random or domain_wall")
+        if self.initial_mode not in {"stripe", "random", "domain_wall", "tanh"}:
+            raise ValueError("initial_mode must be stripe, random, domain_wall or tanh")
+        if self.initial_mode == "tanh" and (self.a >= 0 or self.kappa <= 0
+                or not math.isfinite(self.radius) or not 0 < self.radius < self.n*self.dx/2):
+            raise ValueError("tanh requires a<0, kappa>0 and 0<radius<n*dx/2")
         if self.initial_mode == "domain_wall" and (self.a >= 0 or self.kappa <= 0 or abs(self.mean) > 1e-12):
             raise ValueError("domain_wall initialization requires a<0, kappa>0 and mean=0")
         if not isinstance(self.include_no_interaction, bool):
@@ -153,6 +157,13 @@ class DatasetConfig:
 
 def dataset_preset(name: str = "demo") -> DatasetConfig:
     """Quick checks, demo, finer observation, or the LRAMB time protocol."""
+    if name in {"g_steady", "production", "production_v2", "production_v3"}:
+        return DatasetConfig(ells=(2.,), strengths=(-.2, -.1, -.04, -.02, 0., .02, .04),
+            n=64, dt=.01, a=-.25, b=.25, kappa=1., lam=1., D=.1,
+            initial_mode="tanh", radius=16., burn_steps=2_000_000,
+            production_steps=8192, sample_every=1, train_trajectories=32,
+            validation_trajectories=4, test_trajectories=5,
+            movie_trajectories=1, movie_window_steps=100)
     if name == "quick":
         return DatasetConfig(n=8, burn_steps=16, production_steps=64,
                              sample_every=1, blocks=4, train_trajectories=2,
@@ -165,23 +176,6 @@ def dataset_preset(name: str = "demo") -> DatasetConfig:
         return DatasetConfig(burn_steps=16_000, sample_every=1,
                              train_trajectories=8, validation_trajectories=4,
                              test_trajectories=4)
-    if name == "production":
-        # 128 independent trajectories x 8192 adjacent frame pairs = 2**20
-        # training pairs per condition, including the single g=0 control.
-        return DatasetConfig(burn_steps=16_000, sample_every=1,
-                             train_trajectories=128, validation_trajectories=4,
-                             test_trajectories=4, include_no_interaction=True)
-    if name == "production_v2":
-        # Increase independent trajectories while keeping observation cadence,
-        # dynamics and held-out test seeds identical to production.
-        return replace(dataset_preset("production"), train_trajectories=256,
-                       validation_trajectories=8)
-    if name == "production_v3":
-        return DatasetConfig(strengths=(0.5, 1.0, 2.0), D=0.1, mean=0.0,
-            burn_steps=16_000, production_steps=1_024, sample_every=1,
-            train_trajectories=1_024, validation_trajectories=64, test_trajectories=128,
-            include_no_interaction=True, initial_mode="domain_wall",
-            movie_trajectories=1, movie_window_steps=16)
     if name == "reference":
         return DatasetConfig(n=64, burn_steps=40_000, production_steps=64_000,
                              sample_every=40, blocks=8)
@@ -196,8 +190,8 @@ def condition_id(ell: float, strength: float | None = None) -> str:
         return "no_interaction"
     if strength is not None:
         coupling = float(strength)
-        if not math.isfinite(coupling) or coupling <= 0:
-            raise ValueError("strength must be positive and finite for a range condition")
+        if not math.isfinite(coupling):
+            raise ValueError("strength must be finite for a range condition")
         return f"g_{coupling:.12g}_ell_{value:.12g}"
     return f"ell_{value:.12g}"
 
@@ -214,7 +208,7 @@ def dataset_conditions(config: DatasetConfig) -> list[dict[str, Any]]:
                    condition_id=condition_id(ell, strength if config.strengths is not None else None), is_control=False,
                    label=f"Poisson ell={ell:g}, g={strength:g}")
               for strength in couplings for ell in config.ells]
-    if config.include_no_interaction:
+    if config.include_no_interaction and 0.0 not in couplings:
         result.append(dict(ell=0.0, solver_ell=1.0, strength=0.0,
                            condition_id="no_interaction", is_control=True,
                            label="No long-range interaction (g=0)"))
@@ -455,6 +449,11 @@ def initial_field(model, cfg: DatasetConfig) -> np.ndarray:
     sqrt(2*kappa/abs(a)). Its zero mean follows from half-period antisymmetry.
     Other modes retain LRAMB's seeded initialization unchanged.
     """
+    if cfg.initial_mode == "tanh":
+        coord = np.arange(cfg.n)*cfg.dx - cfg.n*cfg.dx/2
+        x, y = np.meshgrid(coord, coord)
+        return math.sqrt(-cfg.a/cfg.b)*np.tanh(
+            (cfg.radius-np.hypot(x, y))/math.sqrt(2*cfg.kappa/(-cfg.a)))
     if cfg.initial_mode != "domain_wall":
         return model.initial_field(cfg.initial_mode)
     length = cfg.n * cfg.dx
@@ -475,6 +474,7 @@ def _movie_layout(cfg: DatasetConfig) -> dict[str, np.ndarray]:
     ends = np.minimum(starts + cfg.movie_window_steps, intervals)
     return dict(fields=np.empty((len(starts), cfg.n, cfg.n), dtype=np.float32),
         medium_rate_maps=np.empty((len(starts), cfg.n, cfg.n), dtype=np.float64),
+        active_rate_maps=np.empty((len(starts), cfg.n, cfg.n), dtype=np.float64),
         time=(starts + ends) * (cfg.interval / 2),
         window_start=starts, window_end=ends,
         window_duration=(ends - starts) * cfg.interval,
@@ -511,6 +511,7 @@ def _run_numpy(model, cfg: DatasetConfig, multipliers: np.ndarray, *,
     movie = _movie_layout(cfg) if capture_movie else None
     movie_index = 0
     movie_entropy = np.zeros((cfg.n, cfg.n), dtype=np.float64) if capture_movie else None
+    movie_active = np.zeros_like(movie_entropy) if capture_movie else None
 
     def record(index):
         video[index, 0] = phi
@@ -526,6 +527,7 @@ def _run_numpy(model, cfg: DatasetConfig, multipliers: np.ndarray, *,
         ep_maps += ds
         if capture_movie:
             movie_entropy += model.dV * ds.sum(axis=0)
+            movie_active += model.dV * ds[2]
         interval += model.dV * ds.sum(axis=(1, 2))
         phi, ph = new, new_hat
         if step % 100 == 0 and (not np.isfinite(phi).all() or np.max(np.abs(phi)) > 30):
@@ -543,7 +545,9 @@ def _run_numpy(model, cfg: DatasetConfig, multipliers: np.ndarray, *,
             if capture_movie and index == movie["window_end"][movie_index]:
                 movie["fields"][movie_index] = phi
                 movie["medium_rate_maps"][movie_index] = movie_entropy / movie["window_duration"][movie_index]
+                movie["active_rate_maps"][movie_index] = movie_active / movie["window_duration"][movie_index]
                 movie_entropy.fill(0)
+                movie_active.fill(0)
                 movie_index += 1
     if not np.isfinite(video).all() or np.max(np.abs(mass - mass[0])) > 1e-10:
         raise FloatingPointError("Nonfinite trajectory or mass conservation failure")
@@ -596,6 +600,7 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
     movie = _movie_layout(cfg) if capture_movie else None
     movie_index = 0
     movie_entropy = torch.zeros((cfg.n, cfg.n), **kw) if capture_movie else None
+    movie_active = torch.zeros_like(movie_entropy) if capture_movie else None
 
     def advance():
         normal = torch.randn((2, *phi.shape), generator=rng, **kw)
@@ -636,6 +641,7 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
             ep_maps += ds
             if capture_movie:
                 movie_entropy += model.dV * ds.sum(dim=0)
+                movie_active += model.dV * ds[2]
             interval += model.dV * ds.sum(dim=(1, 2))
             phi, ph = new, new_hat
             if step % 100 == 0 and (not torch.isfinite(phi).all() or phi.abs().max() > 30):
@@ -654,7 +660,10 @@ def _run_torch(model, cfg: DatasetConfig, multipliers: np.ndarray, device: str, 
                     movie["fields"][movie_index] = phi.float().cpu().numpy()
                     movie["medium_rate_maps"][movie_index] = (
                         movie_entropy / movie["window_duration"][movie_index]).cpu().numpy()
+                    movie["active_rate_maps"][movie_index] = (
+                        movie_active / movie["window_duration"][movie_index]).cpu().numpy()
                     movie_entropy.zero_()
+                    movie_active.zero_()
                     movie_index += 1
         if not torch.isfinite(video).all() or (mass - mass[0]).abs().max() > 1e-10:
             raise FloatingPointError("Nonfinite trajectory or mass conservation failure")
@@ -1038,8 +1047,10 @@ def finalize_generation(output_dir: str | Path) -> dict[str, Any]:
                     movie = payload.get("movie")
                     windows = math.ceil((frames - 1) / config.movie_window_steps)
                     if (movie is None or tuple(movie["fields"].shape) != (windows, config.n, config.n)
-                            or movie["medium_rate_maps"].shape != movie["fields"].shape):
-                        raise ValueError(f"Selected trajectory is missing complete medium EP movie windows: {path}")
+                            or movie["medium_rate_maps"].shape != movie["fields"].shape
+                            or "active_rate_maps" not in movie
+                            or movie["active_rate_maps"].shape != movie["fields"].shape):
+                        raise ValueError(f"Selected trajectory is missing complete EP movie windows: {path}")
                 current_hash = metadata["kernel_multiplier_sha256"]
                 if multiplier_hash is not None and current_hash != multiplier_hash:
                     raise ValueError(f"Kernel hash differs within a split: {path}")
